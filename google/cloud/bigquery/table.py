@@ -16,12 +16,24 @@
 
 from __future__ import absolute_import
 
+import asyncio
 import copy
 import datetime
 import functools
 import operator
 import typing
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union, Sequence
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    Sequence,
+)
 
 import warnings
 
@@ -57,6 +69,7 @@ else:
 
 import google.api_core.exceptions
 from google.api_core.page_iterator import HTTPIterator
+from google.api_core.page_iterator import Page
 
 import google.cloud._helpers  # type: ignore
 from google.cloud.bigquery import _helpers
@@ -1747,6 +1760,19 @@ class _NoopProgressBarQueue(object):
         """Don't actually do anything with the item."""
 
 
+# Sentinel (and its marker type) used by :class:`AsyncRowIterator` when
+# driving a synchronous generator in a worker thread. ``StopIteration`` can't
+# be raised through a :class:`concurrent.futures.Future` (it would surface as
+# ``RuntimeError``), so ``next(iterator, _ASYNC_ITERATOR_EXHAUSTED)`` is used
+# instead. The dedicated type lets static type checkers narrow the result of
+# ``next`` back to a page or row.
+class _AsyncIteratorExhausted(object):
+    pass
+
+
+_ASYNC_ITERATOR_EXHAUSTED = _AsyncIteratorExhausted()
+
+
 class RowIterator(HTTPIterator):
     """A class for iterating through HTTP/JSON API row list responses.
 
@@ -3133,6 +3159,195 @@ class _EmptyRowIterator(RowIterator):
 
     def __iter__(self):
         return iter(())
+
+
+class AsyncPage(object):
+    """Asynchronous adapter for a page of rows.
+
+    Wraps a :class:`google.api_core.page_iterator.Page` produced by a
+    synchronous :class:`RowIterator` so that the page can be iterated with
+    ``async for``.
+
+    The rows of a page are already materialized when the page is fetched, so
+    iterating a page does not trigger any additional API requests, regardless
+    of whether the synchronous or asynchronous iteration protocol is used.
+
+    Args:
+        page (google.api_core.page_iterator.Page):
+            The synchronous page to adapt.
+    """
+
+    def __init__(self, page: Page):
+        self._page = page
+
+    @property
+    def num_items(self) -> int:
+        """int: Total items in the page."""
+        return self._page.num_items
+
+    @property
+    def remaining(self) -> int:
+        """int: Remaining (not yet consumed) items in the page."""
+        return self._page.remaining
+
+    @property
+    def raw_page(self) -> Dict[str, Any]:
+        """Dict[str, Any]: The raw API response the page was created from."""
+        return self._page.raw_page
+
+    def __iter__(self) -> Iterator[Row]:
+        """Iterate the rows in the page synchronously."""
+        return iter(self._page)
+
+    def __aiter__(self) -> "AsyncPage":
+        return self
+
+    async def __anext__(self) -> Row:
+        try:
+            return next(self._page)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+class AsyncRowIterator(object):
+    """Asynchronous pagination adapter for :class:`RowIterator`.
+
+    Wraps an existing :class:`RowIterator` and exposes its rows and pages
+    through the asynchronous iteration protocol. The potentially blocking API
+    requests are executed in worker threads via :func:`asyncio.to_thread`, so
+    the event loop is not blocked while a page is being fetched.
+
+    Rather than re-implementing the pagination state machine, this adapter
+    drives the wrapped iterator. As a result, the paging semantics are
+    identical to those of :class:`RowIterator`:
+
+    * The constructor ``page_token`` is used as the initial
+      ``next_page_token`` and is sent as the ``pageToken`` query parameter on
+      the first request. The ``pageToken`` field of each response becomes the
+      token of the next request.
+    * ``total_rows`` is taken from the constructor and updated from the
+      ``totalRows`` field of each API response, but is never reset when a
+      subsequent response omits the field.
+    * ``max_results``, ``page_size``, ``startIndex`` and the cached
+      ``first_page_response`` are handled exactly as in the synchronous
+      iterator.
+
+    Iterating the adapter consumes (and mutates) the wrapped iterator, so it
+    must not be iterated concurrently or also iterated synchronously.
+
+    Args:
+        row_iterator (RowIterator):
+            The synchronous row iterator to adapt.
+
+    Example:
+        >>> sync_iterator = client.list_rows(table)
+        >>> async_iterator = AsyncRowIterator(sync_iterator)
+        >>> async for row in async_iterator:
+        ...     print(row)
+    """
+
+    def __init__(self, row_iterator: RowIterator) -> None:
+        self._iterator = row_iterator
+        self._started = False
+        self._active_iterator: Optional[AsyncIterator[Row]] = None
+
+    @property
+    def row_iterator(self) -> RowIterator:
+        """RowIterator: The wrapped synchronous row iterator."""
+        return self._iterator
+
+    @property
+    def client(self):
+        """The API client of the wrapped iterator."""
+        return self._iterator.client
+
+    @property
+    def path(self) -> str:
+        """str: The method path used for page requests."""
+        return self._iterator.path
+
+    @property
+    def schema(self):
+        """List[google.cloud.bigquery.schema.SchemaField]: The schema used to
+        decode the rows."""
+        return self._iterator.schema
+
+    @property
+    def total_rows(self):
+        """Optional[int]: The total number of rows, if known.
+
+        Delegated to the wrapped iterator, so the value always reflects the
+        latest ``totalRows`` seen in an API response.
+        """
+        return self._iterator.total_rows
+
+    @property
+    def next_page_token(self):
+        """Optional[str]: The token for the next page of results.
+
+        Before iteration starts, this is the constructor ``page_token``;
+        after each fetched page it is the response's ``pageToken``.
+        """
+        return self._iterator.next_page_token
+
+    @property
+    def page_number(self) -> int:
+        """int: The number of pages fetched so far."""
+        return self._iterator.page_number
+
+    @property
+    def num_results(self) -> int:
+        """int: The number of rows fetched so far."""
+        return self._iterator.num_results
+
+    @property
+    def max_results(self) -> Optional[int]:
+        """Optional[int]: The maximum number of results to fetch."""
+        return self._iterator.max_results
+
+    @property
+    def pages(self) -> AsyncIterator[AsyncPage]:
+        """An async iterator of the pages in the response.
+
+        Returns:
+            The async iterator of :class:`AsyncPage` instances.
+
+        Raises:
+            ValueError: If the adapter has already been started.
+        """
+        if self._started:
+            raise ValueError("Iterator has already started", self)
+        self._started = True
+        sync_pages = self._iterator.pages
+        return self._pages_aiter(sync_pages)
+
+    async def _pages_aiter(
+        self, sync_pages: Iterator[Page]
+    ) -> AsyncIterator[AsyncPage]:
+        while True:
+            page = await asyncio.to_thread(next, sync_pages, _ASYNC_ITERATOR_EXHAUSTED)
+            if isinstance(page, _AsyncIteratorExhausted):
+                return
+            yield AsyncPage(page)
+
+    def __aiter__(self) -> AsyncIterator[Row]:
+        if self._started:
+            raise ValueError("Iterator has already started", self)
+        self._started = True
+        sync_items = iter(self._iterator)
+        return self._items_aiter(sync_items)
+
+    async def _items_aiter(self, sync_items: Iterator[Row]) -> AsyncIterator[Row]:
+        while True:
+            item = await asyncio.to_thread(next, sync_items, _ASYNC_ITERATOR_EXHAUSTED)
+            if isinstance(item, _AsyncIteratorExhausted):
+                return
+            yield item
+
+    def __anext__(self):
+        if self._active_iterator is None:
+            self._active_iterator = self.__aiter__()
+        return self._active_iterator.__anext__()
 
 
 class PartitionRange(object):

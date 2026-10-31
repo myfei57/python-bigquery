@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import datetime
 import logging
 import re
+import threading
 import time
 import types
 import unittest
@@ -5701,6 +5703,332 @@ class TestRowIterator(unittest.TestCase):
             self.assertEqual(list(map(str, df.g.area)), ["0.0"])
 
         self.assertEqual([v.__class__.__name__ for v in df.g], ["Point"])
+
+
+class TestAsyncRowIterator(unittest.TestCase):
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    @staticmethod
+    def _schema():
+        from google.cloud.bigquery.schema import SchemaField
+
+        return [
+            SchemaField("name", "STRING", mode="REQUIRED"),
+            SchemaField("age", "INTEGER", mode="REQUIRED"),
+        ]
+
+    @staticmethod
+    def _rows(*pairs):
+        return [{"f": [{"v": name}, {"v": str(age)}]} for name, age in pairs]
+
+    def _make_sync(self, api_request=None, path="/foo", **kwargs):
+        from google.cloud.bigquery.table import RowIterator
+
+        if api_request is None:
+            api_request = mock.Mock(return_value={"rows": []})
+
+        return RowIterator(
+            _mock_client(),
+            api_request,
+            path,
+            self._schema(),
+            table=TableReference.from_string("my-project.my_dataset.my_table"),
+            **kwargs,
+        )
+
+    def _make_one(self, api_request=None, **kwargs):
+        from google.cloud.bigquery.table import AsyncRowIterator
+
+        return AsyncRowIterator(self._make_sync(api_request, **kwargs))
+
+    def test_constructor(self):
+        from google.cloud.bigquery.table import AsyncRowIterator
+
+        sync = self._make_sync(total_rows=42, page_token="start-token")
+        async_iter = AsyncRowIterator(sync)
+
+        self.assertIs(async_iter.row_iterator, sync)
+        self.assertIs(async_iter.client, sync.client)
+        self.assertEqual(async_iter.path, "/foo")
+        self.assertEqual(async_iter.schema, sync.schema)
+        self.assertEqual(async_iter.total_rows, 42)
+        self.assertEqual(async_iter.next_page_token, "start-token")
+        self.assertEqual(async_iter.page_number, 0)
+        self.assertEqual(async_iter.num_results, 0)
+        self.assertIsNone(async_iter.max_results)
+
+    def test_iterate_rows(self):
+        api_request = mock.Mock(
+            return_value={
+                "rows": self._rows(("Phred", 32), ("Bharney", 33)),
+            }
+        )
+        async_iter = self._make_one(api_request)
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual(
+            [(row.name, row.age) for row in rows],
+            [("Phred", 32), ("Bharney", 33)],
+        )
+        self.assertEqual(async_iter.num_results, 2)
+        api_request.assert_called_once_with(method="GET", path="/foo", query_params={})
+
+    def test_page_token_forwarded_between_pages(self):
+        page_one = {
+            "rows": self._rows(("Phred", 32), ("Bharney", 33)),
+            "pageToken": "token-two",
+            "totalRows": "4",
+        }
+        page_two = {"rows": self._rows(("Whillma", 27), ("Bhetty", 28))}
+        api_request = mock.Mock(side_effect=[page_one, page_two])
+        async_iter = self._make_one(api_request, page_token="token-one")
+
+        self.assertEqual(async_iter.next_page_token, "token-one")
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual(
+            [(row.name, row.age) for row in rows],
+            [("Phred", 32), ("Bharney", 33), ("Whillma", 27), ("Bhetty", 28)],
+        )
+        self.assertEqual(
+            [call.kwargs["query_params"] for call in api_request.call_args_list],
+            [{"pageToken": "token-one"}, {"pageToken": "token-two"}],
+        )
+        self.assertIsNone(async_iter.next_page_token)
+        self.assertEqual(async_iter.total_rows, 4)
+        self.assertEqual(async_iter.page_number, 2)
+        self.assertEqual(async_iter.num_results, 4)
+
+    def test_total_rows_updated_from_response(self):
+        page_one = {
+            "rows": self._rows(("Phred", 32)),
+            "pageToken": "token-two",
+            "totalRows": "7",
+        }
+        page_two = {"rows": self._rows(("Bharney", 33))}
+        api_request = mock.Mock(side_effect=[page_one, page_two])
+        async_iter = self._make_one(api_request, total_rows=4)
+
+        self.assertEqual(async_iter.total_rows, 4)
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual(len(rows), 2)
+        # Updated from the first response and preserved even though the
+        # second response omits the ``totalRows`` field.
+        self.assertEqual(async_iter.total_rows, 7)
+
+    def test_total_rows_kept_when_absent_from_responses(self):
+        api_request = mock.Mock(return_value={"rows": self._rows(("Phred", 32))})
+        async_iter = self._make_one(api_request, total_rows=4)
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        self._run(consume())
+        self.assertEqual(async_iter.total_rows, 4)
+
+    def test_pages(self):
+        from google.cloud.bigquery.table import AsyncPage
+
+        page_one = {
+            "rows": self._rows(("Phred", 32), ("Bharney", 33)),
+            "pageToken": "token-two",
+        }
+        page_two = {"rows": self._rows(("Whillma", 27))}
+        api_request = mock.Mock(side_effect=[page_one, page_two])
+        async_iter = self._make_one(api_request)
+
+        async def consume():
+            pages = []
+            async for page in async_iter.pages:
+                pages.append(page)
+            return pages
+
+        pages = self._run(consume())
+
+        self.assertEqual(len(pages), 2)
+        self.assertIsInstance(pages[0], AsyncPage)
+        self.assertEqual([page.num_items for page in pages], [2, 1])
+        self.assertIs(pages[0].raw_page, page_one)
+
+        # Fetched pages support both iteration protocols without triggering
+        # any additional API requests.
+        first_rows = list(pages[0])
+        self.assertEqual([row.name for row in first_rows], ["Phred", "Bharney"])
+        self.assertEqual(pages[0].remaining, 0)
+
+        async def last_page_rows():
+            return [row async for row in pages[1]]
+
+        self.assertEqual([row.name for row in self._run(last_page_rows())], ["Whillma"])
+        self.assertEqual(async_iter.page_number, 2)
+        self.assertEqual(async_iter.num_results, 3)
+        self.assertEqual(api_request.call_count, 2)
+
+    def test_cached_first_page_response(self):
+        first_page = {
+            "rows": self._rows(("Whillma", 27), ("Bhetty", 28)),
+            "pageToken": "token-two",
+        }
+        second_page = {"rows": self._rows(("Phred", 32), ("Bharney", 33))}
+        api_request = mock.Mock(return_value=second_page)
+        async_iter = self._make_one(
+            api_request, first_page_response=first_page, total_rows=4
+        )
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual([row.age for row in rows], [27, 28, 32, 33])
+        api_request.assert_called_once_with(
+            method="GET", path="/foo", query_params={"pageToken": "token-two"}
+        )
+        self.assertEqual(async_iter.total_rows, 4)
+
+    def test_max_results_with_cached_first_page(self):
+        first_page = {
+            "rows": self._rows(
+                ("Whillma", 27),
+                ("Bhetty", 28),
+                ("Phred", 32),
+                ("Bharney", 33),
+            ),
+            "pageToken": "token-two",
+        }
+        api_request = mock.Mock(return_value=first_page)
+        async_iter = self._make_one(
+            api_request, max_results=3, first_page_response=first_page
+        )
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual([row.age for row in rows], [27, 28, 32])
+        api_request.assert_not_called()
+
+    def test_page_size_sent_as_max_results(self):
+        api_request = mock.Mock(return_value={"rows": self._rows(("Phred", 32))})
+        async_iter = self._make_one(api_request, page_size=4)
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        self._run(consume())
+
+        api_request.assert_called_once_with(
+            method="GET", path="/foo", query_params={"maxResults": 4}
+        )
+
+    def test_api_request_runs_in_worker_thread(self):
+        main_thread_id = threading.get_ident()
+        request_thread_ids = []
+
+        def api_request_side_effect(**kwargs):
+            request_thread_ids.append(threading.get_ident())
+            return {"rows": self._rows(("Phred", 32))}
+
+        api_request = mock.Mock(side_effect=api_request_side_effect)
+        async_iter = self._make_one(api_request)
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        rows = self._run(consume())
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(request_thread_ids), 1)
+        self.assertNotEqual(request_thread_ids[0], main_thread_id)
+
+    def test_rows_cannot_be_iterated_twice(self):
+        async_iter = self._make_one(
+            mock.Mock(return_value={"rows": self._rows(("Phred", 32))})
+        )
+
+        async def consume_twice():
+            async for _ in async_iter:
+                pass
+            async for _ in async_iter:
+                pass
+
+        with self.assertRaises(ValueError):
+            self._run(consume_twice())
+
+        # The adapter stays in the started state, so accessing ``pages``
+        # after row iteration also fails.
+        with self.assertRaises(ValueError):
+            async_iter.pages
+
+    def test_pages_cannot_be_iterated_twice(self):
+        async_iter = self._make_one(
+            mock.Mock(return_value={"rows": self._rows(("Phred", 32))})
+        )
+        pages = async_iter.pages
+
+        async def drain():
+            async for _ in pages:
+                pass
+
+        self._run(drain())
+
+        with self.assertRaises(ValueError):
+            async_iter.pages
+
+        async def iterate_rows():
+            async for _ in async_iter:
+                pass
+
+        with self.assertRaises(ValueError):
+            self._run(iterate_rows())
+
+    def test_anext(self):
+        api_request = mock.Mock(
+            return_value={
+                "rows": self._rows(("Phred", 32), ("Bharney", 33)),
+            }
+        )
+        async_iter = self._make_one(api_request)
+
+        async def consume():
+            first = await async_iter.__anext__()
+            second = await async_iter.__anext__()
+            with self.assertRaises(StopAsyncIteration):
+                await async_iter.__anext__()
+            return first, second
+
+        first, second = self._run(consume())
+        self.assertEqual(first.name, "Phred")
+        self.assertEqual(second.name, "Bharney")
+        self.assertEqual(async_iter.num_results, 2)
+
+    def test_empty_row_iterator(self):
+        from google.cloud.bigquery.table import AsyncRowIterator
+        from google.cloud.bigquery.table import _EmptyRowIterator
+
+        async_iter = AsyncRowIterator(_EmptyRowIterator())
+
+        async def consume():
+            return [row async for row in async_iter]
+
+        self.assertEqual(self._run(consume()), [])
+        self.assertEqual(async_iter.total_rows, 0)
 
 
 class TestPartitionRange(unittest.TestCase):
