@@ -9734,6 +9734,586 @@ class TestClientUpload(object):
         expected_bytes = b'{"emoji": "' + emoji.encode("utf8") + b'"}'
         assert sent_data_file.getvalue() == expected_bytes
 
+    # load_table_from_json_iterator() tests
+
+    @staticmethod
+    def _make_json_rows(n_rows, events=None):
+        """An iterable that records when a row is actually pulled."""
+
+        def gen():
+            for i in range(n_rows):
+                if events is not None:
+                    events.append(("read", i))
+                yield {"i": i}
+
+        return gen()
+
+    @staticmethod
+    def _make_upload_mock(events):
+        """A stand-in for Client.load_table_from_file recording call order."""
+
+        def upload(client, file_obj, destination, **kwargs):
+            job_id = kwargs["job_id"]
+            events.append(("upload", job_id))
+            load_job = mock.Mock()
+            load_job.job_id = job_id
+
+            def result(*args, **kwargs):
+                events.append(("result", job_id))
+                return load_job
+
+            load_job.result.side_effect = result
+            return load_job
+
+        return mock.Mock(side_effect=upload)
+
+    def test_load_table_from_json_iterator_batches_and_sequencing(self):
+        from google.cloud.bigquery.client import _DEFAULT_NUM_RETRIES
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        events = []
+        rows = self._make_json_rows(10, events)
+        job_config = job_module.LoadJobConfig(autodetect=True)
+
+        upload = self._make_upload_mock(events)
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=upload.side_effect,
+        ) as load_table_from_file, mock.patch(
+            "google.cloud.bigquery.client.Client.get_table", autospec=True
+        ) as get_table:
+            gen = client.load_table_from_json_iterator(
+                rows,
+                self.TABLE_REF,
+                "p_",
+                rows_per_batch=3,
+                location="EU",
+                project="project-x",
+                job_config=job_config,
+            )
+
+            # Nothing is consumed and no job exists before the first next().
+            assert events == []
+
+            results = list(gen)
+
+        # Table probing must be skipped (autodetect explicitly given).
+        get_table.assert_not_called()
+
+        # 3 + 3 + 3 + 1 rows, the last job also awaited when the loop ends.
+        assert [r.batch_number for r in results] == [0, 1, 2, 3]
+        assert [r.input_row_range for r in results] == [
+            range(0, 3),
+            range(3, 6),
+            range(6, 9),
+            range(9, 10),
+        ]
+        assert [r.job.job_id for r in results] == ["p_0", "p_1", "p_2", "p_3"]
+
+        # Every row is pulled exactly once and a batch's rows are only pulled
+        # after the previous batch's job has finished successfully.
+        expected_events = [
+            ("read", 0),
+            ("read", 1),
+            ("read", 2),
+            ("upload", "p_0"),
+            ("result", "p_0"),
+            ("read", 3),
+            ("read", 4),
+            ("read", 5),
+            ("upload", "p_1"),
+            ("result", "p_1"),
+            ("read", 6),
+            ("read", 7),
+            ("read", 8),
+            ("upload", "p_2"),
+            ("result", "p_2"),
+            ("read", 9),
+            ("upload", "p_3"),
+            ("result", "p_3"),
+        ]
+        assert events == expected_events
+
+        assert load_table_from_file.call_count == 4
+        for batch_number, mock_call in enumerate(load_table_from_file.mock_calls):
+            _client, file_obj, table_ref = mock_call[1]
+            kwargs = mock_call[2]
+            payload = file_obj.getvalue()
+            assert table_ref == self.TABLE_REF
+            assert kwargs["job_id"] == "p_{}".format(batch_number)
+            assert "job_id_prefix" not in kwargs
+            assert kwargs["location"] == "EU"
+            assert kwargs["project"] == "project-x"
+            assert kwargs["num_retries"] == _DEFAULT_NUM_RETRIES
+            assert kwargs["timeout"] == DEFAULT_TIMEOUT
+            assert (
+                kwargs["job_config"].source_format
+                == job_module.SourceFormat.NEWLINE_DELIMITED_JSON
+            )
+            assert kwargs["job_config"].autodetect is True
+            assert kwargs["size"] == len(payload)
+            payload_rows = [
+                json.loads(line) for line in payload.decode("utf-8").split("\n")
+            ]
+            expected = results[batch_number].input_row_range
+            assert payload_rows == [{"i": i} for i in expected]
+
+    def test_load_table_from_json_iterator_stop_early_creates_no_more_jobs(self):
+        from google.cloud.bigquery.job import LoadJobConfig
+
+        client = self._make_client()
+        events = []
+        rows = self._make_json_rows(100, events)
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock(events).side_effect,
+        ) as load_table_from_file:
+            gen = client.load_table_from_json_iterator(
+                rows,
+                self.TABLE_REF,
+                "stop-",
+                rows_per_batch=4,
+                job_config=LoadJobConfig(autodetect=True),
+            )
+            first = next(gen)
+            assert first.batch_number == 0
+            assert first.input_row_range == range(0, 4)
+            gen.close()
+
+        # Only the single yielded batch exists; input beyond it is untouched
+        # and closing the generator schedules nothing in the background.
+        assert load_table_from_file.call_count == 1
+        assert events == [
+            ("read", 0),
+            ("read", 1),
+            ("read", 2),
+            ("read", 3),
+            ("upload", "stop-0"),
+        ]
+
+    def test_load_table_from_json_iterator_rejects_non_append_dispositions(self):
+        from google.cloud.bigquery.job import LoadJobConfig, WriteDisposition
+
+        client = self._make_client()
+
+        for disposition in (
+            WriteDisposition.WRITE_TRUNCATE,
+            WriteDisposition.WRITE_EMPTY,
+        ):
+            pulled = []
+
+            def rows():
+                pulled.append(1)
+                yield {"i": 1}
+
+            job_config = LoadJobConfig(write_disposition=disposition, autodetect=True)
+            with mock.patch(
+                "google.cloud.bigquery.client.Client.load_table_from_file",
+                autospec=True,
+            ) as load_table_from_file:
+                with pytest.raises(ValueError, match="append writes"):
+                    # Rejected eagerly, before the generator is even started.
+                    client.load_table_from_json_iterator(
+                        rows(), self.TABLE_REF, "p_", job_config=job_config
+                    )
+                assert pulled == []
+                load_table_from_file.assert_not_called()
+
+    def test_load_table_from_json_iterator_rejects_invalid_arguments(self):
+        from google.cloud.bigquery.job import CopyJobConfig
+
+        client = self._make_client()
+        rows = [{"i": 1}]
+
+        with pytest.raises(ValueError, match="job_id_prefix"):
+            client.load_table_from_json_iterator(rows, self.TABLE_REF, "")
+        with pytest.raises(ValueError, match="job_id_prefix"):
+            client.load_table_from_json_iterator(rows, self.TABLE_REF, "has space")
+        with pytest.raises(ValueError, match="job_id_prefix"):
+            client.load_table_from_json_iterator(rows, self.TABLE_REF, None)
+
+        with pytest.raises(ValueError, match="rows_per_batch"):
+            client.load_table_from_json_iterator(
+                rows, self.TABLE_REF, "p_", rows_per_batch=0
+            )
+        with pytest.raises(ValueError, match="rows_per_batch"):
+            client.load_table_from_json_iterator(
+                rows, self.TABLE_REF, "p_", rows_per_batch=True
+            )
+
+        with pytest.raises(ValueError, match="byte_limit_per_batch"):
+            client.load_table_from_json_iterator(
+                rows, self.TABLE_REF, "p_", byte_limit_per_batch=0
+            )
+
+        with pytest.raises(TypeError, match="LoadJobConfig"):
+            client.load_table_from_json_iterator(
+                rows, self.TABLE_REF, "p_", job_config=CopyJobConfig()
+            )
+
+    def test_load_table_from_json_iterator_empty_input(self):
+        from google.cloud.bigquery.job import LoadJobConfig
+
+        client = self._make_client()
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+        ) as load_table_from_file:
+            gen = client.load_table_from_json_iterator(
+                iter([]),
+                self.TABLE_REF,
+                "empty-",
+                job_config=LoadJobConfig(autodetect=True),
+            )
+            with pytest.raises(ValueError, match="did not yield any rows"):
+                next(gen)
+            load_table_from_file.assert_not_called()
+
+    def test_load_table_from_json_iterator_multibyte_byte_budget(self):
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        emoji = "\U0001F3E6"  # 4 UTF-8 bytes per character.
+        rows = [{"s": "ab"}, {"s": emoji * 2}, {"s": "cd"}]
+        line_sizes = [
+            len(json.dumps(row, ensure_ascii=False).encode("utf-8")) for row in rows
+        ]
+        assert line_sizes == [11, 17, 11]
+
+        # First batch must flush once 11 + 1 + 17 == 29 bytes are accumulated,
+        # proving the budget is measured in UTF-8 bytes (only 13 characters).
+        byte_limit = 29
+        captured_payloads = []
+
+        def upload(client, file_obj, destination, **kwargs):
+            captured_payloads.append(file_obj.getvalue())
+            load_job = mock.Mock()
+            load_job.job_id = kwargs["job_id"]
+            load_job.result.return_value = load_job
+            return load_job
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=upload,
+        ):
+            results = list(
+                client.load_table_from_json_iterator(
+                    rows,
+                    self.TABLE_REF,
+                    "mb-",
+                    byte_limit_per_batch=byte_limit,
+                    job_config=job_module.LoadJobConfig(autodetect=True),
+                )
+            )
+
+        assert [r.input_row_range for r in results] == [range(0, 2), range(2, 3)]
+        assert [r.job.job_id for r in results] == ["mb-0", "mb-1"]
+        assert captured_payloads[0] == (
+            json.dumps(rows[0], ensure_ascii=False).encode("utf-8")
+            + b"\n"
+            + json.dumps(rows[1], ensure_ascii=False).encode("utf-8")
+        )
+        assert len(captured_payloads[0]) == byte_limit
+        assert captured_payloads[1] == json.dumps(rows[2], ensure_ascii=False).encode(
+            "utf-8"
+        )
+
+    def test_load_table_from_json_iterator_single_row_over_byte_limit(self):
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        # First row serializes to 12 bytes, second one can never fit a 15-byte
+        # batch.
+        rows = [{"s": "ok"}, {"s": "q" * 30}]
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+        ) as load_table_from_file:
+            gen = client.load_table_from_json_iterator(
+                rows,
+                self.TABLE_REF,
+                "big-",
+                byte_limit_per_batch=15,
+                job_config=job_module.LoadJobConfig(autodetect=True),
+            )
+            with pytest.raises(ValueError, match="global input index 1"):
+                next(gen)
+            load_table_from_file.assert_not_called()
+
+    def test_load_table_from_json_iterator_serialization_failure_midway(self):
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        rows = [
+            {"i": 0},
+            {"i": 1},
+            {"i": 2, "bad": object()},  # not JSON serializable
+            {"i": 3},
+        ]
+        job_config = job_module.LoadJobConfig(
+            autodetect=True,
+        )
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock([]).side_effect,
+        ) as load_table_from_file:
+            gen = client.load_table_from_json_iterator(
+                rows,
+                self.TABLE_REF,
+                "ser-",
+                rows_per_batch=2,
+                job_config=job_config,
+            )
+            first = next(gen)
+            assert first.input_row_range == range(0, 2)
+            with pytest.raises(ValueError, match="global input index 2"):
+                next(gen)
+            # Only the first batch was uploaded; row 3 was never pulled.
+            assert load_table_from_file.call_count == 1
+
+    def test_load_table_from_json_iterator_job_failure_is_wrapped(self):
+        from google.cloud.bigquery.job import LoadJobConfig
+        from google.cloud.bigquery.exceptions import JsonBatchLoadError
+
+        client = self._make_client()
+        pulled = []
+
+        def rows():
+            for i in range(4):
+                pulled.append(i)
+                yield {"i": i}
+
+        failed_job = mock.Mock()
+        failed_job.job_id = "fail-0"
+        failed_job.result.side_effect = RuntimeError("job exploded")
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            return_value=failed_job,
+        ):
+            gen = client.load_table_from_json_iterator(
+                rows(),
+                self.TABLE_REF,
+                "fail-",
+                rows_per_batch=2,
+                job_config=LoadJobConfig(autodetect=True),
+            )
+            first = next(gen)
+            with pytest.raises(JsonBatchLoadError) as exc_info:
+                next(gen)
+
+        error = exc_info.value
+        assert error.batch_number == 0
+        assert error.input_row_range == range(0, 2)
+        assert error.job_id == "fail-0"
+        assert isinstance(error.__cause__, RuntimeError)
+        # The second batch is not consumed while the first one is failing.
+        assert pulled == [0, 1]
+        assert first.job is failed_job
+
+    def test_load_table_from_json_iterator_upload_failure_is_wrapped(self):
+        from google.cloud.bigquery.job import LoadJobConfig
+        from google.cloud.bigquery.exceptions import JsonBatchLoadError
+        import google.api_core.exceptions
+
+        client = self._make_client()
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=google.api_core.exceptions.InternalServerError("boom"),
+        ):
+            gen = client.load_table_from_json_iterator(
+                [{"i": 0}],
+                self.TABLE_REF,
+                "up-",
+                rows_per_batch=1,
+                job_config=LoadJobConfig(autodetect=True),
+            )
+            with pytest.raises(JsonBatchLoadError) as exc_info:
+                next(gen)
+
+        error = exc_info.value
+        assert error.batch_number == 0
+        assert error.input_row_range == range(0, 1)
+        assert error.job_id == "up-0"
+        assert isinstance(
+            error.__cause__, google.api_core.exceptions.InternalServerError
+        )
+
+    def test_load_table_from_json_iterator_deterministic_job_ids_at_upload(self):
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        rows = [{"i": 0}, {"i": 1}]
+        job_config = job_module.LoadJobConfig(autodetect=True)
+        metadata_seen = []
+
+        def do_multipart(stream, metadata, size, num_retries, timeout, project=None):
+            metadata_seen.append(copy.deepcopy(metadata))
+            job_id = metadata["jobReference"]["jobId"]
+            response = mock.Mock()
+            response.json.return_value = {
+                "jobReference": {"projectId": self.PROJECT, "jobId": job_id},
+                "configuration": {"load": {}},
+                "status": {"state": "DONE"},
+            }
+            return response
+
+        client._do_multipart_upload = mock.Mock(side_effect=do_multipart)
+        with mock.patch(
+            "google.cloud.bigquery.job.LoadJob.result", autospec=True
+        ) as await_job:
+            results_1 = list(
+                client.load_table_from_json_iterator(
+                    rows,
+                    self.TABLE_REF,
+                    "det-",
+                    rows_per_batch=1,
+                    job_config=job_config,
+                )
+            )
+        assert await_job.call_count == 2
+        ids_1 = [metadata["jobReference"]["jobId"] for metadata in metadata_seen]
+        assert ids_1 == ["det-0", "det-1"]
+        assert [r.job.job_id for r in results_1] == ["det-0", "det-1"]
+
+        # Replaying the same input reproduces the exact same job IDs, so a
+        # retried upload cannot end up creating a second job for a batch.
+        metadata_seen.clear()
+        client._do_multipart_upload = mock.Mock(side_effect=do_multipart)
+        with mock.patch("google.cloud.bigquery.job.LoadJob.result", autospec=True):
+            list(
+                client.load_table_from_json_iterator(
+                    rows,
+                    self.TABLE_REF,
+                    "det-",
+                    rows_per_batch=1,
+                    job_config=job_module.LoadJobConfig(autodetect=True),
+                )
+            )
+        ids_2 = [metadata["jobReference"]["jobId"] for metadata in metadata_seen]
+        assert ids_2 == ids_1
+
+    def test_load_table_from_json_iterator_does_not_mutate_callers_config(self):
+        from google.cloud.bigquery import job as job_module
+        from google.cloud.bigquery.schema import SchemaField
+
+        client = self._make_client()
+        schema = [SchemaField("i", "INTEGER")]
+        job_config = job_module.LoadJobConfig(schema=schema)
+        job_config._properties["load"]["unknown_field"] = "foobar"
+        original_config_copy = copy.deepcopy(job_config)
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock([]).side_effect,
+        ) as load_table_from_file, mock.patch(
+            "google.cloud.bigquery.client.Client.get_table", autospec=True
+        ) as get_table:
+            list(
+                client.load_table_from_json_iterator(
+                    [{"i": 0}, {"i": 1}],
+                    self.TABLE_REF,
+                    "cfg-",
+                    rows_per_batch=1,
+                    job_config=job_config,
+                )
+            )
+
+        assert job_config.to_api_repr() == original_config_copy.to_api_repr()
+        get_table.assert_not_called()
+        for mock_call in load_table_from_file.mock_calls:
+            sent_config = mock_call[2]["job_config"]
+            assert (
+                sent_config.source_format
+                == job_module.SourceFormat.NEWLINE_DELIMITED_JSON
+            )
+            assert sent_config.schema == schema
+
+    def test_load_table_from_json_iterator_uses_default_job_config(self):
+        from google.cloud.bigquery import job as job_module
+
+        client = self._make_client()
+        default_config = job_module.LoadJobConfig(autodetect=True)
+        client.default_load_job_config = default_config
+
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock([]).side_effect,
+        ) as load_table_from_file, mock.patch(
+            "google.cloud.bigquery.client.Client.get_table", autospec=True
+        ) as get_table:
+            list(
+                client.load_table_from_json_iterator([{"i": 0}], self.TABLE_REF, "def-")
+            )
+
+        # autodetect comes from the client default, no table probe required.
+        get_table.assert_not_called()
+        sent_config = load_table_from_file.mock_calls[0][2]["job_config"]
+        assert sent_config.autodetect is True
+        # And the client's default config itself is not mutated.
+        assert default_config.source_format is None
+
+    def test_load_table_from_json_iterator_probes_table_at_most_once(self):
+        import google.api_core.exceptions
+
+        # No schema and no autodetect: a missing table means autodetect=True.
+        client = self._make_client()
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock([]).side_effect,
+        ), mock.patch(
+            "google.cloud.bigquery.client.Client.get_table",
+            autospec=True,
+            side_effect=google.api_core.exceptions.NotFound("missing"),
+        ) as get_table:
+            results = list(
+                client.load_table_from_json_iterator(
+                    [{"i": 0}, {"i": 1}, {"i": 2}],
+                    self.TABLE_REF,
+                    "probe-",
+                    rows_per_batch=1,
+                )
+            )
+
+        assert get_table.call_count == 1
+        assert len(results) == 3
+
+        # An existing table means autodetect=False, still only one probe.
+        client = self._make_client()
+        with mock.patch(
+            "google.cloud.bigquery.client.Client.load_table_from_file",
+            autospec=True,
+            side_effect=self._make_upload_mock([]).side_effect,
+        ) as load_table_from_file, mock.patch(
+            "google.cloud.bigquery.client.Client.get_table",
+            autospec=True,
+            return_value=mock.Mock(),
+        ) as get_table:
+            list(
+                client.load_table_from_json_iterator(
+                    [{"i": 0}], self.TABLE_REF, "probe-", rows_per_batch=1
+                )
+            )
+
+        assert get_table.call_count == 1
+        sent_config = load_table_from_file.mock_calls[0][2]["job_config"]
+        assert sent_config.autodetect is False
+
     # Low-level tests
     def test_schema_from_json_with_file_object(self):
         from google.cloud.bigquery.schema import SchemaField

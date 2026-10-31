@@ -20,6 +20,7 @@ from __future__ import division
 
 from collections import abc as collections_abc
 import copy
+import dataclasses
 import datetime
 import functools
 import gzip
@@ -28,6 +29,7 @@ import itertools
 import json
 import math
 import os
+import re
 import tempfile
 import typing
 from typing import (
@@ -36,6 +38,7 @@ from typing import (
     Dict,
     IO,
     Iterable,
+    Iterator,
     Mapping,
     List,
     Optional,
@@ -143,6 +146,14 @@ if typing.TYPE_CHECKING:  # pragma: NO COVER
 _DEFAULT_CHUNKSIZE = 100 * 1024 * 1024  # 100 MB
 _MAX_MULTIPART_SIZE = 5 * 1024 * 1024
 _DEFAULT_NUM_RETRIES = 6
+# Each batch produced by load_table_from_json_iterator() is uploaded as a
+# single multipart upload, so the default NDJSON byte budget matches the
+# multipart threshold (a single JSON row may still be larger, in which case
+# the upload transparently switches to a resumable upload for that batch).
+_DEFAULT_JSON_BATCH_BYTE_LIMIT = _MAX_MULTIPART_SIZE
+# Valid characters in a BigQuery job ID, see
+# https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#JobReference
+_JOB_ID_PATTERN = r"[A-Za-z0-9_-]+"
 _BASE_UPLOAD_TEMPLATE = "{host}/upload/bigquery/v2/projects/{project}/jobs?uploadType="
 _MULTIPART_URL_TEMPLATE = _BASE_UPLOAD_TEMPLATE + "multipart"
 _RESUMABLE_URL_TEMPLATE = _BASE_UPLOAD_TEMPLATE + "resumable"
@@ -164,6 +175,32 @@ _LIST_ROWS_FROM_QUERY_RESULTS_FIELDS = "jobReference,totalRows,pageToken,rows"
 _MIN_GET_QUERY_RESULTS_TIMEOUT = 120
 
 TIMEOUT_HEADER = "X-Server-Timeout"
+
+
+@dataclasses.dataclass(frozen=True)
+class JsonBatchLoadResult:
+    """One batch produced by
+    :meth:`Client.load_table_from_json_iterator
+    <google.cloud.bigquery.client.Client.load_table_from_json_iterator>`.
+
+    Attributes:
+        batch_number (int):
+            Zero-based number of the batch within the load. It is also used to
+            derive the deterministic job ID, so replaying the same input
+            produces the same job IDs.
+        input_row_range (range):
+            Half-open ``range`` of the global input row indices contained in
+            this batch, e.g. ``range(100, 200)`` means global input rows 100
+            through 199. Use it to slice the caller-retained rows when
+            replaying a failed batch.
+        job (google.cloud.bigquery.job.LoadJob):
+            The load job created for this batch. The next batch is not
+            consumed from the input until this job has finished successfully.
+    """
+
+    batch_number: int
+    input_row_range: range
+    job: "LoadJob"
 
 
 class Project(object):
@@ -3063,6 +3100,338 @@ class Client(ClientWithProject):
             job_config=new_job_config,
             timeout=timeout,
         )
+
+    def load_table_from_json_iterator(
+        self,
+        json_rows: Iterable[Dict[str, Any]],
+        destination: Union[Table, TableReference, TableListItem, str],
+        job_id_prefix: str,
+        rows_per_batch: Optional[int] = None,
+        byte_limit_per_batch: int = _DEFAULT_JSON_BATCH_BYTE_LIMIT,
+        num_retries: int = _DEFAULT_NUM_RETRIES,
+        location: Optional[str] = None,
+        project: Optional[str] = None,
+        job_config: Optional[LoadJobConfig] = None,
+        timeout: ResumableTimeoutType = DEFAULT_TIMEOUT,
+    ) -> Iterator[JsonBatchLoadResult]:
+        """Load JSON rows from an iterator, splitting them into separate jobs.
+
+        Unlike :meth:`load_table_from_json`, this method does not buffer the
+        whole input in memory before creating a load job. Instead,
+        ``json_rows`` is traversed exactly once and grouped into batches of
+        newline-delimited JSON, each uploaded as its own independent
+        :class:`~google.cloud.bigquery.job.LoadJob`.
+
+        This is a lazy generator: a
+        :class:`JsonBatchLoadResult` is yielded for every batch, and rows of
+        the next batch are not consumed from ``json_rows`` until the previous
+        batch's job has finished successfully. If iteration is stopped early
+        (for example with ``break``), no further jobs are created in the
+        background.
+
+        Every batch gets a reproducible job ID of the form
+        ``f"{job_id_prefix}{batch_number}"`` (e.g. ``"my-load-0"``,
+        ``"my-load-1"``). Because the ID is fixed before the upload starts,
+        retrying the upload can never create a second job for the same batch.
+        When a batch fails, :class:`~google.cloud.bigquery.exceptions.JsonBatchLoadError`
+        is raised carrying the batch number, the global input row range and
+        the job ID, so the caller can replay just that batch using the rows it
+        retained for it.
+
+        .. note::
+
+            Only append writes are supported in this version. A
+            ``job_config`` with
+            :attr:`~google.cloud.bigquery.job.WriteDisposition.WRITE_TRUNCATE`
+            or
+            :attr:`~google.cloud.bigquery.job.WriteDisposition.WRITE_EMPTY`
+            is rejected up front, before any row of ``json_rows`` is
+            consumed. The passed-in ``job_config`` object is never modified.
+
+        Args:
+            json_rows (Iterable[Dict[str, Any]]):
+                Row data to be inserted, traversed exactly once. Keys must
+                match the table schema fields and values must be JSON
+                serializable.
+            destination (Union[ \
+                google.cloud.bigquery.table.Table, \
+                google.cloud.bigquery.table.TableReference, \
+                google.cloud.bigquery.table.TableListItem, \
+                str, \
+            ]):
+                Table into which data is to be loaded. If a string is passed
+                in, this method attempts to create a table reference from a
+                string using
+                :func:`google.cloud.bigquery.table.TableReference.from_string`.
+            job_id_prefix (str):
+                Non-empty prefix used to build the deterministic, reproducible
+                job ID of every batch (``f"{job_id_prefix}{batch_number}"``).
+                Only ASCII letters, digits, dashes and underscores are
+                allowed.
+            rows_per_batch (Optional[int]):
+                Maximum number of input rows in a single batch. If ``None``,
+                batches are bounded by ``byte_limit_per_batch`` only.
+            byte_limit_per_batch (Optional[int]):
+                Upper bound, in UTF-8 bytes, of the newline-delimited JSON
+                payload of a single batch. Multibyte characters count with
+                their encoded byte length. A batch may only exceed this bound
+                if a single serialized row is itself larger, in which case
+                that row is rejected. Defaults to 5 MiB.
+            num_retries (Optional[int]): Number of upload retries. Defaults to 6.
+            location (Optional[str]):
+                Location where to run the jobs. Must match the location of
+                the destination table.
+            project (Optional[str]):
+                Project ID of the project of where to run the jobs. Defaults
+                to the client's project.
+            job_config (Optional[google.cloud.bigquery.job.LoadJobConfig]):
+                Extra configuration options for the jobs. The object is
+                copied and never modified. The ``source_format`` is always
+                forced to
+                :attr:`~google.cloud.bigquery.job.SourceFormat.NEWLINE_DELIMITED_JSON`,
+                and ``write_disposition`` must not be
+                ``WRITE_TRUNCATE``/``WRITE_EMPTY``. When neither an explicit
+                ``schema`` nor ``autodetect`` is given, the destination
+                table is probed once, just like
+                :meth:`load_table_from_json`.
+            timeout (Optional[float]):
+                The number of seconds to wait for the underlying HTTP transport
+                before using ``retry``. Depending on the retry strategy, a request
+                may be repeated several times using the same timeout each time.
+
+                Can also be passed as a tuple (connect_timeout, read_timeout).
+                See :meth:`requests.Session.request` documentation for details.
+
+        Yields:
+            JsonBatchLoadResult:
+                The batch number, the half-open range of global input row
+                indices in the batch, and the started
+                :class:`~google.cloud.bigquery.job.LoadJob`.
+
+        Raises:
+            ValueError:
+                If an argument is invalid (bad prefix, non-positive batch
+                size, etc.), if ``write_disposition`` is
+                ``WRITE_TRUNCATE``/``WRITE_EMPTY``, if ``json_rows`` is
+                empty, if a single serialized row exceeds
+                ``byte_limit_per_batch``, or if a row cannot be serialized
+                to JSON.
+            TypeError:
+                If ``job_config`` is not an instance of
+                :class:`~google.cloud.bigquery.job.LoadJobConfig` class.
+            google.cloud.bigquery.exceptions.JsonBatchLoadError:
+                If the load job of a batch cannot be started or does not
+                finish successfully. The exception carries the batch number,
+                the global input row range and the job ID of that batch.
+        """
+        if not isinstance(job_id_prefix, str) or not job_id_prefix:
+            raise ValueError(
+                "job_id_prefix must be a non-empty string, got: {!r}".format(
+                    job_id_prefix
+                )
+            )
+        if re.fullmatch(_JOB_ID_PATTERN, job_id_prefix) is None:
+            raise ValueError(
+                "job_id_prefix {!r} contains invalid characters; only ASCII "
+                "letters, digits, dashes ('-') and underscores ('_') are "
+                "allowed in a BigQuery job ID.".format(job_id_prefix)
+            )
+
+        if rows_per_batch is not None and (
+            isinstance(rows_per_batch, bool)
+            or not isinstance(rows_per_batch, int)
+            or rows_per_batch < 1
+        ):
+            raise ValueError(
+                "rows_per_batch must be a positive integer or None, got: "
+                "{!r}".format(rows_per_batch)
+            )
+
+        if (
+            isinstance(byte_limit_per_batch, bool)
+            or not isinstance(byte_limit_per_batch, int)
+            or byte_limit_per_batch < 1
+        ):
+            raise ValueError(
+                "byte_limit_per_batch must be a positive integer, got: "
+                "{!r}".format(byte_limit_per_batch)
+            )
+
+        if job_config is not None:
+            _verify_job_config_type(job_config, LoadJobConfig)
+        else:
+            job_config = job.LoadJobConfig()
+
+        # _fill_from_default() deep-copies job_config, so the caller-provided
+        # configuration object is never mutated by this method.
+        new_job_config = job_config._fill_from_default(self._default_load_job_config)
+        new_job_config.source_format = job.SourceFormat.NEWLINE_DELIMITED_JSON
+
+        # Only append writes are supported. Reject other dispositions before
+        # consuming any input row.
+        write_disposition = new_job_config.write_disposition
+        if write_disposition in (
+            job.WriteDisposition.WRITE_TRUNCATE,
+            job.WriteDisposition.WRITE_EMPTY,
+        ):
+            raise ValueError(
+                "load_table_from_json_iterator only supports append writes, "
+                "but write_disposition was set to {!r}. Either remove the "
+                "write_disposition (or set it to WRITE_APPEND), or use "
+                "load_table_from_json for a single truncating/empty-only "
+                "job.".format(write_disposition)
+            )
+
+        if project is None:
+            project = self.project
+
+        if location is None:
+            location = self.location
+
+        destination = _table_arg_to_table_ref(destination, default_project=self.project)
+
+        # Resolve the autodetect value once up front, mirroring
+        # load_table_from_json(). This happens before any input row is
+        # consumed and at most one get_table RPC is issued.
+        if new_job_config.schema is None and new_job_config.autodetect is None:
+            try:
+                self.get_table(destination)
+            except core_exceptions.NotFound:
+                new_job_config.autodetect = True
+            else:
+                new_job_config.autodetect = False
+
+        return self._load_table_from_json_batches(
+            json_rows,
+            destination,
+            job_id_prefix=job_id_prefix,
+            rows_per_batch=rows_per_batch,
+            byte_limit_per_batch=byte_limit_per_batch,
+            num_retries=num_retries,
+            location=location,
+            project=project,
+            job_config=new_job_config,
+            timeout=timeout,
+        )
+
+    def _load_table_from_json_batches(
+        self,
+        json_rows: Iterable[Dict[str, Any]],
+        destination: TableReference,
+        job_id_prefix: str,
+        rows_per_batch: Optional[int],
+        byte_limit_per_batch: int,
+        num_retries: int,
+        location: Optional[str],
+        project: Optional[str],
+        job_config: LoadJobConfig,
+        timeout: ResumableTimeoutType,
+    ) -> Iterator[JsonBatchLoadResult]:
+        """Generator implementing :meth:`load_table_from_json_iterator`.
+
+        All arguments have already been validated and ``job_config`` is a
+        private copy the caller does not hold a reference to.
+        """
+        row_iterator = iter(json_rows)
+        global_row_index = 0
+        batch_number = 0
+        pending_result: Optional[JsonBatchLoadResult] = None
+
+        while True:
+            # Do not consume (or even pull) any row of the next batch until
+            # the previous batch's job has finished successfully.
+            if pending_result is not None:
+                try:
+                    pending_result.job.result()
+                except Exception as exc:
+                    raise bq_exceptions.JsonBatchLoadError(
+                        batch_number=pending_result.batch_number,
+                        input_row_range=pending_result.input_row_range,
+                        job_id="{}{}".format(
+                            job_id_prefix, pending_result.batch_number
+                        ),
+                    ) from exc
+                pending_result = None
+
+            batch_start = global_row_index
+            batch_lines: List[bytes] = []
+            batch_size = 0  # NDJSON size in UTF-8 bytes, separators included.
+
+            while True:
+                try:
+                    row = next(row_iterator)
+                except StopIteration:
+                    break
+
+                try:
+                    line = json.dumps(row, ensure_ascii=False).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Could not serialize the JSON row at global input "
+                        "index {} (while filling batch {}) to "
+                        "newline-delimited JSON.".format(global_row_index, batch_number)
+                    ) from exc
+
+                if len(line) > byte_limit_per_batch:
+                    raise ValueError(
+                        "The JSON row at global input index {} serializes to "
+                        "{} UTF-8 bytes, which exceeds byte_limit_per_batch "
+                        "of {} bytes. A single row must fit within the byte "
+                        "budget; increase byte_limit_per_batch or shrink the "
+                        "row.".format(global_row_index, len(line), byte_limit_per_batch)
+                    )
+
+                # Account for the '\n' separator that precedes every line
+                # except the first one in the batch.
+                batch_size += len(line) + (1 if batch_lines else 0)
+                batch_lines.append(line)
+                global_row_index += 1
+
+                if rows_per_batch is not None and len(batch_lines) >= rows_per_batch:
+                    break
+                if batch_size >= byte_limit_per_batch:
+                    break
+
+            if not batch_lines:
+                if batch_number == 0:
+                    raise ValueError(
+                        "json_rows did not yield any rows; at least one row "
+                        "is required for a load job."
+                    )
+                return
+
+            batch_data = b"\n".join(batch_lines)
+            batch_range = range(batch_start, global_row_index)
+            batch_job_id = "{}{}".format(job_id_prefix, batch_number)
+
+            try:
+                load_job = self.load_table_from_file(
+                    io.BytesIO(batch_data),
+                    destination,
+                    size=len(batch_data),
+                    num_retries=num_retries,
+                    job_id=batch_job_id,
+                    location=location,
+                    project=project,
+                    job_config=job_config,
+                    timeout=timeout,
+                )
+            except bq_exceptions.JsonBatchLoadError:
+                raise
+            except Exception as exc:
+                raise bq_exceptions.JsonBatchLoadError(
+                    batch_number=batch_number,
+                    input_row_range=batch_range,
+                    job_id=batch_job_id,
+                ) from exc
+
+            pending_result = JsonBatchLoadResult(
+                batch_number=batch_number,
+                input_row_range=batch_range,
+                job=load_job,
+            )
+            batch_number += 1
+            yield pending_result
 
     def _do_resumable_upload(
         self,

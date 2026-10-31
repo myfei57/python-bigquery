@@ -34,6 +34,7 @@ from google.cloud.bigquery import version as bigquery_version
 __version__ = bigquery_version.__version__
 
 from google.cloud.bigquery.client import Client
+from google.cloud.bigquery.client import JsonBatchLoadResult
 from google.cloud.bigquery.dataset import AccessEntry
 from google.cloud.bigquery.dataset import Dataset
 from google.cloud.bigquery.dataset import DatasetReference
@@ -43,6 +44,7 @@ from google.cloud.bigquery.enums import DecimalTargetType
 from google.cloud.bigquery.enums import KeyResultStatementKind
 from google.cloud.bigquery.enums import SqlTypeNames
 from google.cloud.bigquery.enums import StandardSqlTypeNames
+from google.cloud.bigquery.exceptions import JsonBatchLoadError
 from google.cloud.bigquery.exceptions import LegacyBigQueryStorageError
 from google.cloud.bigquery.exceptions import LegacyPandasError
 from google.cloud.bigquery.exceptions import LegacyPyarrowError
@@ -172,6 +174,8 @@ __all__ = [
     "ExtractJobConfig",
     "LoadJob",
     "LoadJobConfig",
+    "JsonBatchLoadResult",
+    "JsonBatchLoadError",
     "SessionInfo",
     "UnknownJob",
     # Models
