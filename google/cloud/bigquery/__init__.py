@@ -100,6 +100,7 @@ from google.cloud.bigquery.routine import RoutineType
 from google.cloud.bigquery.routine import RemoteFunctionOptions
 from google.cloud.bigquery.routine import ExternalRuntimeOptions
 from google.cloud.bigquery.schema import PolicyTagList
+from google.cloud.bigquery.schema import project_schema
 from google.cloud.bigquery.schema import SchemaField
 from google.cloud.bigquery.schema import FieldElementType
 from google.cloud.bigquery.standard_sql import StandardSqlDataType
@@ -187,6 +188,7 @@ __all__ = [
     "SchemaField",
     "FieldElementType",
     "PolicyTagList",
+    "project_schema",
     "UDFResource",
     "ExternalConfig",
     "AvroOptions",

@@ -1569,3 +1569,385 @@ class TestStorageDescriptor:
             serde_info=self.SERDEINFO,
         )
         assert result.to_api_repr() == expected.to_api_repr()
+
+
+class TestProjectSchema:
+    """Tests for the schema.project_schema() helper."""
+
+    @staticmethod
+    def _project(schema_, *paths):
+        from google.cloud.bigquery.schema import project_schema
+
+        return project_schema(schema_, *paths)
+
+    @staticmethod
+    def _make_schema():
+        address = bigquery.SchemaField(
+            "address",
+            "RECORD",
+            mode="NULLABLE",
+            description="an address",
+            policy_tags=PolicyTagList(names=("policy-tag-address",)),
+            fields=(
+                bigquery.SchemaField(
+                    "city",
+                    "STRING",
+                    description="a city",
+                    policy_tags=PolicyTagList(names=("policy-tag-city",)),
+                ),
+                bigquery.SchemaField("zip", "STRING"),
+                bigquery.SchemaField(
+                    "geo",
+                    "STRUCT",
+                    fields=(
+                        bigquery.SchemaField("lat", "FLOAT64"),
+                        bigquery.SchemaField("lng", "FLOAT64"),
+                    ),
+                ),
+            ),
+        )
+        contacts = bigquery.SchemaField(
+            "contacts",
+            "RECORD",
+            mode="REPEATED",
+            fields=(
+                bigquery.SchemaField("type", "STRING"),
+                bigquery.SchemaField("value", "STRING"),
+            ),
+        )
+        return [
+            bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+            bigquery.SchemaField(
+                "name",
+                "STRING",
+                description="full name",
+                policy_tags=PolicyTagList(names=("policy-tag-name",)),
+            ),
+            bigquery.SchemaField("dot.field", "STRING"),
+            address,
+            contacts,
+            bigquery.SchemaField("scores", "INTEGER", mode="REPEATED"),
+        ]
+
+    def test_empty_selection_returns_empty_list(self):
+        schema_ = self._make_schema()
+        assert self._project(schema_) == []
+        assert self._project(()) == []
+
+    def test_select_top_level_fields_follows_schema_order(self):
+        schema_ = self._make_schema()
+
+        # Paths intentionally given in reverse order.
+        result = self._project(schema_, ("scores",), ("id",))
+
+        assert [field.name for field in result] == ["id", "scores"]
+        assert result[0] == schema_[0]
+        assert result[1] == schema_[5]
+        assert result[0].mode == "REQUIRED"
+        assert result[1].mode == "REPEATED"
+
+    def test_select_nested_field_keeps_parent_metadata(self):
+        schema_ = self._make_schema()
+
+        result = self._project(schema_, ("address", "city"))
+
+        assert len(result) == 1
+        address = result[0]
+        assert address.name == "address"
+        assert address.field_type == "RECORD"
+        assert address.mode == "NULLABLE"
+        assert address.description == "an address"
+        assert address.policy_tags == PolicyTagList(names=("policy-tag-address",))
+        assert address.fields == (schema_[3].fields[0],)
+
+        city = address.fields[0]
+        assert city.description == "a city"
+        assert city.policy_tags == PolicyTagList(names=("policy-tag-city",))
+
+    def test_select_deeply_nested_field_keeps_all_ancestors(self):
+        schema_ = self._make_schema()
+
+        result = self._project(schema_, ("address", "geo", "lat"))
+
+        assert [field.name for field in result] == ["address"]
+        address = result[0]
+        assert address.mode == "NULLABLE"
+        assert address.description == "an address"
+        assert [child.name for child in address.fields] == ["geo"]
+
+        geo = address.fields[0]
+        assert geo.field_type == "STRUCT"
+        assert geo.fields == (schema_[3].fields[2].fields[0],)
+
+    def test_select_parent_field_keeps_all_subfields(self):
+        schema_ = self._make_schema()
+
+        result = self._project(schema_, ["address"])
+
+        assert result == [schema_[3]]
+
+    def test_shared_parent_paths_merge_in_schema_order(self):
+        schema_ = self._make_schema()
+
+        result = self._project(
+            schema_,
+            ("address", "geo", "lng"),
+            ("address", "zip"),
+            ("address", "geo", "lat"),
+        )
+
+        address = result[0]
+        assert [child.name for child in address.fields] == ["zip", "geo"]
+        assert [child.name for child in address.fields[1].fields] == ["lat", "lng"]
+
+    def test_duplicate_paths_do_not_duplicate_output(self):
+        schema_ = self._make_schema()
+
+        result = self._project(
+            schema_,
+            ("address", "city"),
+            ("address", "city"),
+            (
+                "address",
+                "city",
+            ),
+        )
+
+        assert len(result) == 1
+        assert [child.name for child in result[0].fields] == ["city"]
+
+    def test_parent_and_child_selected_together_keeps_whole_parent(self):
+        schema_ = self._make_schema()
+
+        result_child_first = self._project(schema_, ("address", "city"), ("address",))
+        result_parent_first = self._project(schema_, ("address",), ("address", "city"))
+
+        assert result_child_first == [schema_[3]]
+        assert result_parent_first == [schema_[3]]
+        assert [child.name for child in result_child_first[0].fields] == [
+            "city",
+            "zip",
+            "geo",
+        ]
+
+    def test_repeated_record_preserves_mode(self):
+        schema_ = self._make_schema()
+
+        result = self._project(schema_, ("contacts", "value"))
+
+        assert len(result) == 1
+        contacts = result[0]
+        assert contacts.field_type == "RECORD"
+        assert contacts.mode == "REPEATED"
+        assert contacts.fields == (schema_[4].fields[1],)
+
+    def test_field_names_containing_dots_are_single_segments(self):
+        schema_ = self._make_schema()
+
+        result = self._project(schema_, ("dot.field",))
+
+        assert [field.name for field in result] == ["dot.field"]
+        assert result == [schema_[2]]
+
+        # A dotted name must not be split into segments.
+        with pytest.raises(ValueError):
+            self._project(schema_, ("dot", "field"))
+
+    def test_list_and_tuple_paths_are_both_accepted(self):
+        schema_ = self._make_schema()
+
+        result_list = self._project(schema_, ["address", "city"])
+        result_tuple = self._project(schema_, ("address", "city"))
+
+        assert result_list == result_tuple
+
+    def test_accepts_api_repr_dicts(self):
+        schema_ = self._make_schema()
+        schema_dicts = [field.to_api_repr() for field in schema_]
+
+        result = self._project(schema_dicts, ("address", "city"))
+
+        assert result == [
+            bigquery.SchemaField(
+                "address",
+                "RECORD",
+                mode="NULLABLE",
+                description="an address",
+                policy_tags=PolicyTagList(names=("policy-tag-address",)),
+                fields=(schema_[3].fields[0],),
+            )
+        ]
+
+    def test_result_is_deeply_isolated_from_input_schema(self):
+        schema_ = self._make_schema()
+        original_repr = copy.deepcopy([field.to_api_repr() for field in schema_])
+        original_input = list(schema_)
+
+        result = self._project(
+            schema_,
+            ("address", "city"),
+            ("address", "geo", "lat"),
+            ("id",),
+        )
+
+        # The projected objects are new instances, not the input objects.
+        assert result[0] is not schema_[0]
+        assert all(new is not old for new, old in zip(result, [schema_[0], schema_[3]]))
+
+        address = result[1]
+        assert address is not schema_[3]
+
+        # Mutate the projected API representation at every nesting level,
+        # including nested policy tag metadata.
+        address.to_api_repr()["description"] = "mutated address"
+        address.to_api_repr()["policyTags"]["names"].append("new-address-tag")
+        address.to_api_repr()["fields"].append({"name": "injected", "type": "STRING"})
+
+        city = address.fields[0]
+        city.to_api_repr()["description"] = "mutated city"
+        city.to_api_repr()["policyTags"]["names"].append("new-city-tag")
+
+        geo = address.fields[1]
+        geo.fields[0].to_api_repr()["description"] = "mutated lat"
+
+        # The input SchemaFields and their API representation are unchanged.
+        assert [field.to_api_repr() for field in schema_] == original_repr
+        assert schema_ == original_input
+        assert schema_[3].description == "an address"
+        assert schema_[3].policy_tags.names == ("policy-tag-address",)
+        assert [child.name for child in schema_[3].fields] == ["city", "zip", "geo"]
+        assert schema_[3].fields[0].description == "a city"
+        assert schema_[3].fields[0].policy_tags.names == ("policy-tag-city",)
+        assert schema_[3].fields[2].fields[0].description is None
+
+    def test_result_is_isolated_when_input_shares_api_repr(self):
+        # SchemaField.from_api_repr() intentionally aliases the input dict, so
+        # callers may build a schema directly on top of a shared resource dict.
+        shared_resource = {
+            "name": "address",
+            "type": "RECORD",
+            "mode": "NULLABLE",
+            "fields": [
+                {"name": "city", "type": "STRING"},
+                {"name": "zip", "type": "STRING"},
+            ],
+        }
+        field = bigquery.SchemaField.from_api_repr(shared_resource)
+
+        result = self._project([field], ("address", "city"))
+        result[0].to_api_repr()["fields"][0]["name"] = "mutated"
+        result[0].to_api_repr()["fields"][0]["policyTags"] = {"names": ["tag"]}
+
+        assert shared_resource["fields"][0] == {"name": "city", "type": "STRING"}
+        assert field.fields[0].name == "city"
+
+    def test_error_on_empty_path(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ())
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("id",), ())
+
+    def test_error_on_string_path(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(TypeError):
+            self._project(schema_, "address.city")
+
+    def test_error_on_non_sequence_path(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(TypeError):
+            self._project(schema_, 123)
+
+    def test_error_on_non_string_segment(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(TypeError):
+            self._project(schema_, ("address", 5))
+
+    def test_error_on_missing_top_level_field(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("does_not_exist",))
+
+    def test_error_on_missing_nested_field(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(ValueError):
+            self._project(
+                schema_,
+                (
+                    "address",
+                    "does_not_exist",
+                ),
+            )
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("address", "geo", "does_not_exist"))
+
+    def test_error_on_empty_string_segment(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("address", ""))
+
+    def test_error_when_path_traverses_non_record_field(self):
+        schema_ = self._make_schema()
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("name", "first"))
+
+        with pytest.raises(ValueError):
+            self._project(schema_, ("id", "x"))
+
+        # A REPEATED scalar is still not a RECORD and cannot be traversed.
+        with pytest.raises(ValueError):
+            self._project(schema_, ("scores", "x"))
+
+    def test_error_on_duplicate_sibling_field_names(self):
+        duplicated_top_level = [
+            bigquery.SchemaField("dup", "STRING"),
+            bigquery.SchemaField("dup", "INTEGER"),
+            bigquery.SchemaField("other", "STRING"),
+        ]
+
+        with pytest.raises(ValueError):
+            self._project(duplicated_top_level, ("dup",))
+
+        duplicated_nested = [
+            bigquery.SchemaField(
+                "address",
+                "RECORD",
+                fields=(
+                    bigquery.SchemaField("city", "STRING"),
+                    bigquery.SchemaField("city", "STRING"),
+                ),
+            )
+        ]
+
+        with pytest.raises(ValueError):
+            self._project(duplicated_nested, ("address", "city"))
+
+    def test_invalid_path_does_not_modify_input(self):
+        schema_ = self._make_schema()
+        original_repr = copy.deepcopy([field.to_api_repr() for field in schema_])
+
+        for invalid_path in (
+            (),
+            "address.city",
+            42,
+            ("address", "nope"),
+            ("name", "first"),
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                self._project(schema_, invalid_path)
+
+        assert [field.to_api_repr() for field in schema_] == original_repr
+
+    def test_function_is_exported_from_top_level_package(self):
+        assert bigquery.project_schema is schema.project_schema
+        assert "project_schema" in bigquery.__all__

@@ -15,9 +15,10 @@
 """Schemas for BigQuery tables / queries."""
 
 from __future__ import annotations
+import copy
 import enum
 import typing
-from typing import Any, cast, Dict, Iterable, Optional, Union, Sequence
+from typing import Any, cast, Dict, Iterable, List, Mapping, Optional, Union, Sequence
 
 from google.cloud.bigquery import _helpers
 from google.cloud.bigquery import standard_sql
@@ -575,6 +576,225 @@ def _to_schema_fields(schema):
 
     else:
         raise TypeError("Schema must be a Sequence (e.g. a list) or None.")
+
+
+def _format_field_path(path: Sequence[str]) -> str:
+    """Render a field path (a sequence of name segments) for error messages."""
+    return "[" + ", ".join(repr(segment) for segment in path) + "]"
+
+
+def _coerce_field_path(path: Any) -> tuple[str, ...]:
+    """Validate a user-provided field path and turn it into a tuple of names.
+
+    A field path is a sequence of field name segments, e.g. ``("address", "city")``.
+    Dot-separated strings are rejected on purpose because field names themselves
+    are allowed to contain dots, making a single string ambiguous.
+    """
+    if isinstance(path, str):
+        raise TypeError(
+            "Field path must be a sequence of field name segments, e.g. "
+            "('address', 'city'), not a single string. Pass a tuple or list of "
+            "name segments so that field names containing '.' are not split."
+        )
+    if not isinstance(path, Sequence):
+        raise TypeError(
+            "Field path must be a sequence (e.g. a tuple or list) of field name "
+            f"segments, got {type(path).__name__} instead."
+        )
+
+    segments = tuple(path)
+    if not segments:
+        raise ValueError("Field path must contain at least one field name segment.")
+
+    for segment in segments:
+        if not isinstance(segment, str):
+            raise TypeError(
+                "Every segment of a field path must be a field name string, got "
+                f"{type(segment).__name__} in path {_format_field_path(segments)}."
+            )
+
+    return segments
+
+
+def _validate_field_path(
+    segments: Sequence[str], schema: Sequence[SchemaField]
+) -> None:
+    """Check that every segment of ``segments`` exists in ``schema``.
+
+    Also rejects paths that traverse a non-RECORD/STRUCT field and schemas with
+    duplicate sibling field names, both of which make projection ambiguous.
+    """
+    current_fields: Sequence[SchemaField] = schema
+
+    for depth, name in enumerate(segments):
+        path_so_far = segments[: depth + 1]
+        matches = [field for field in current_fields if field.name == name]
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Duplicate sibling field name {name!r} at path "
+                f"{_format_field_path(path_so_far)}: the schema contains more "
+                "than one field with this name, so the field path cannot be "
+                "resolved unambiguously."
+            )
+        if not matches:
+            raise ValueError(
+                f"Field path {_format_field_path(segments)} is invalid: field "
+                f"{_format_field_path(path_so_far)} does not exist in the schema."
+            )
+
+        field = matches[0]
+        if depth < len(segments) - 1:
+            if field.field_type not in _STRUCT_TYPES:
+                raise ValueError(
+                    f"Field path {_format_field_path(segments)} is invalid: "
+                    f"{_format_field_path(path_so_far)} is of type "
+                    f"{field.field_type}, not RECORD/STRUCT, so it has no "
+                    "subfields to select."
+                )
+            current_fields = field.fields
+
+
+def _merge_field_path(
+    segments: Sequence[str], selection: Dict[str, Dict[str, Any]]
+) -> None:
+    """Merge a validated field path into the selection trie.
+
+    Each trie node maps a selected field name to the sub-selection of its
+    children. An empty sub-selection dict means the field itself is selected
+    (all of its children are kept); selecting a field therefore overrides any
+    partial selection of its children.
+    """
+    node = selection
+
+    for depth, name in enumerate(segments):
+        last = depth == len(segments) - 1
+        sub_selection = node.get(name)
+
+        # The whole subtree is already selected, so the remaining segments are
+        # redundant.
+        if sub_selection is not None and not sub_selection:
+            return
+
+        if last:
+            node[name] = {}
+            return
+
+        if sub_selection is None:
+            sub_selection = {}
+            node[name] = sub_selection
+        node = sub_selection
+
+
+def _project_fields(
+    fields: Sequence[SchemaField], selection: Mapping[str, Mapping[str, Any]]
+) -> List[SchemaField]:
+    """Project ``fields`` according to the ``selection`` trie.
+
+    ``fields`` are expected to already be a private deep copy of the caller's
+    schema, so they may be pruned in place without leaking changes into the
+    input.
+    """
+    projected: List[SchemaField] = []
+
+    for field in fields:
+        sub_selection = selection.get(field.name)
+        if sub_selection is None:
+            continue
+
+        if sub_selection:
+            projected_children = _project_fields(field.fields, sub_selection)
+            # The parent's properties are part of the private input copy, so it
+            # is safe to prune its subfields in place.
+            field.to_api_repr()["fields"] = [
+                child.to_api_repr() for child in projected_children
+            ]
+
+        projected.append(field)
+
+    return projected
+
+
+def project_schema(
+    schema: Sequence[Union[SchemaField, Mapping[str, Any]]],
+    *field_paths: Sequence[str],
+) -> List[SchemaField]:
+    """Project a table schema onto the given field paths.
+
+    Creates a new schema containing only the selected fields. When a nested
+    field is selected, all of its ancestor RECORD/STRUCT fields are kept as
+    well, preserving their mode and metadata (description, policy tags, etc.).
+    Selecting a RECORD/STRUCT field directly keeps all of its subfields.
+
+    Field paths are merged when they share ancestor fields, duplicate paths
+    are de-duplicated, and the field order of the original schema is
+    preserved. The result is fully independent from the input schema: the
+    input is never modified and no API requests are made.
+
+    Args:
+        schema:
+            The schema to project, as a sequence of
+            :class:`~google.cloud.bigquery.schema.SchemaField` objects or
+            their API resource representations.
+        field_paths:
+            The fields to select. Each field path is a sequence of field name
+            segments rather than a dot-separated string, so that field names
+            that themselves contain dots are handled correctly, e.g.
+            ``("address", "city")`` selects the ``city`` subfield of the
+            ``address`` RECORD. Passing no field paths results in an empty
+            schema.
+
+    Returns:
+        A new list of :class:`~google.cloud.bigquery.schema.SchemaField`
+        objects containing only the selected fields.
+
+    Raises:
+        TypeError:
+            If a field path is not a sequence of strings, e.g. a single
+            dot-separated string is passed.
+        ValueError:
+            If a field path is empty, if a field path references a field that
+            does not exist, if it traverses a non-RECORD/STRUCT field, or if
+            the schema contains duplicate sibling field names.
+
+    Example:
+
+        .. code-block:: python
+
+            from google.cloud.bigquery import SchemaField, project_schema
+
+            schema = [
+                SchemaField("name", "STRING"),
+                SchemaField(
+                    "address",
+                    "RECORD",
+                    mode="REPEATED",
+                    fields=[
+                        SchemaField("city", "STRING"),
+                        SchemaField("zip", "STRING"),
+                    ],
+                ),
+            ]
+
+            # Keeps the REPEATED "address" RECORD with only the "city" subfield.
+            project_schema(schema, ("address", "city"))
+    """
+    # Work on a private deep copy of the input. Besides making the projected
+    # schema fully independent from the caller's objects, this also prevents
+    # accidental mutation of raw API resource dicts, which
+    # SchemaField.from_api_repr() intentionally aliases and may normalize
+    # (e.g. by injecting a default "mode") when subfields are read.
+    if not isinstance(schema, Sequence):
+        raise TypeError("Schema must be a Sequence (e.g. a list) or None.")
+    fields = _to_schema_fields(copy.deepcopy(schema))
+
+    selection: Dict[str, Dict[str, Any]] = {}
+    for path in field_paths:
+        segments = _coerce_field_path(path)
+        _validate_field_path(segments, fields)
+        _merge_field_path(segments, selection)
+
+    return _project_fields(fields, selection)
 
 
 class PolicyTagList(object):
