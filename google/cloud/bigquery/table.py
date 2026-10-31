@@ -19,6 +19,7 @@ from __future__ import absolute_import
 import copy
 import datetime
 import functools
+import json
 import operator
 import typing
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union, Sequence
@@ -81,6 +82,7 @@ if typing.TYPE_CHECKING:  # pragma: NO COVER
     import geopandas  # type: ignore
     from google.cloud import bigquery_storage  # type: ignore
     from google.cloud.bigquery.dataset import DatasetReference
+    from google.cloud.bigquery.schema import SchemaField
 
 
 _NO_GEOPANDAS_ERROR = (
@@ -1747,6 +1749,343 @@ class _NoopProgressBarQueue(object):
         """Don't actually do anything with the item."""
 
 
+# Versioned on-the-wire format for :class:`RowCheckpoint`.
+ROW_CHECKPOINT_TYPE = "google-cloud-bigquery#rowCheckpoint"
+ROW_CHECKPOINT_FORMAT_VERSION = 1
+
+# What the position was taken against. Only row-by-row iteration over query
+# job results can be checkpointed.
+_CHECKPOINT_SOURCE_QUERY_JOB = "query_job"
+_CHECKPOINT_ITERATION_MODE_ROWS = "rows"
+
+# Explicit position semantics for the first not-yet-delivered row:
+#
+# * ``not_started``: no page has been fetched and no row delivered;
+#   ``nextRowIndex`` is 0 (or the offset the iterator was built with).
+# * ``in_page``: the iterator is paused in the middle of a fetched page;
+#   there are still buffered, undelivered rows on the current page.
+# * ``page_end``: every row of the current page has been delivered, but the
+#   next page has not been fetched yet.
+# * ``exhausted``: every row of the result set has been delivered.
+_CHECKPOINT_POSITION_NOT_STARTED = "not_started"
+_CHECKPOINT_POSITION_IN_PAGE = "in_page"
+_CHECKPOINT_POSITION_PAGE_END = "page_end"
+_CHECKPOINT_POSITION_EXHAUSTED = "exhausted"
+_CHECKPOINT_POSITION_STATES = frozenset(
+    (
+        _CHECKPOINT_POSITION_NOT_STARTED,
+        _CHECKPOINT_POSITION_IN_PAGE,
+        _CHECKPOINT_POSITION_PAGE_END,
+        _CHECKPOINT_POSITION_EXHAUSTED,
+    )
+)
+
+
+class RowCheckpoint(object):
+    """A versioned, persistable checkpoint for resumable query row iteration.
+
+    A checkpoint captures everything a new
+    :class:`~google.cloud.bigquery.client.Client` needs to continue reading
+    the results of an *existing* query job without re-executing the query:
+
+    * the query job coordinates (``project``, ``location``, ``job_id``),
+    * ``next_row_index``, the absolute, zero-based index of the first row
+      that has **not** yet been delivered,
+    * the result :attr:`schema`, which is verified before resuming, and
+    * an explicit :attr:`position_state` describing where the checkpoint was
+      taken (before iteration, in the middle of a page, at a page boundary,
+      or after the last row).
+
+    Checkpoints are plain JSON-compatible dictionaries, so they can be
+    serialized with :meth:`to_json` / :meth:`to_dict` in one process and
+    restored with :meth:`from_json` / :meth:`from_dict` in another process.
+    Use :meth:`RowIterator.create_checkpoint` to create one and
+    :meth:`~google.cloud.bigquery.client.Client.restore_query_rows` to
+    resume iteration.
+
+    Args:
+        resource (Dict[str, Any]):
+            A checkpoint resource, such as one returned by
+            :meth:`to_dict`.
+    """
+
+    __slots__ = ("_resource",)
+
+    def __init__(self, resource: Dict[str, Any]):
+        self._resource = copy.deepcopy(resource)
+        self._validate_resource(self._resource)
+
+    @classmethod
+    def _from_parts(
+        cls,
+        project: str,
+        location: str,
+        job_id: str,
+        next_row_index: int,
+        position_state: str,
+        schema,
+        total_rows: Optional[int] = None,
+    ) -> "RowCheckpoint":
+        """Factory: build a checkpoint from iterator state.
+
+        Args:
+            project: Project that owns the query job.
+            location: Location where the query job ran.
+            job_id: ID of the query job.
+            next_row_index: Absolute index of the first undelivered row.
+            position_state: One of the ``_CHECKPOINT_POSITION_*`` constants.
+            schema: Result schema (SchemaField objects or mappings).
+            total_rows: Total number of rows in the result set, if known.
+
+        Returns:
+            RowCheckpoint
+        """
+        resource: Dict[str, Any] = {
+            "type": ROW_CHECKPOINT_TYPE,
+            "version": ROW_CHECKPOINT_FORMAT_VERSION,
+            "source": _CHECKPOINT_SOURCE_QUERY_JOB,
+            "iterationMode": _CHECKPOINT_ITERATION_MODE_ROWS,
+            "job": {
+                "projectId": project,
+                "location": location,
+                "jobId": job_id,
+            },
+            "position": {
+                "nextRowIndex": int(next_row_index),
+                "state": position_state,
+            },
+            "schema": {
+                "fields": _build_schema_resource(_to_schema_fields(schema)),
+            },
+        }
+        if total_rows is not None:
+            resource["totalRows"] = int(total_rows)
+        return cls(resource)
+
+    @staticmethod
+    def _validate_resource(resource: Any) -> None:
+        """Validate a checkpoint resource, raising ``ValueError`` if invalid."""
+        if not isinstance(resource, dict):
+            raise ValueError("Checkpoint must be a JSON object.")
+
+        if resource.get("type") != ROW_CHECKPOINT_TYPE:
+            raise ValueError(
+                f"Not a BigQuery row checkpoint: expected 'type' to be "
+                f"{ROW_CHECKPOINT_TYPE!r}, got {resource.get('type')!r}."
+            )
+
+        version = resource.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError("Checkpoint 'version' must be an integer.")
+        if version < 1:
+            raise ValueError(f"Unsupported checkpoint version: {version!r}.")
+        if version > ROW_CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                f"Checkpoint version {version} is newer than the version "
+                f"supported by this library ({ROW_CHECKPOINT_FORMAT_VERSION})."
+            )
+
+        if resource.get("source") != _CHECKPOINT_SOURCE_QUERY_JOB:
+            raise ValueError(
+                "Only checkpoints for query job results can be restored; got "
+                f"source {resource.get('source')!r}. Checkpoints from "
+                "table/list_rows iteration are not supported."
+            )
+
+        if resource.get("iterationMode") != _CHECKPOINT_ITERATION_MODE_ROWS:
+            raise ValueError(
+                "Only row-by-row iteration checkpoints can be restored; got "
+                f"iterationMode {resource.get('iterationMode')!r}. BigQuery "
+                "Storage API parallel reads are not supported."
+            )
+
+        job_ref = resource.get("job")
+        if not isinstance(job_ref, dict):
+            raise ValueError("Checkpoint is missing the 'job' object.")
+        for key in ("projectId", "location", "jobId"):
+            if not isinstance(job_ref.get(key), str) or not job_ref[key]:
+                raise ValueError(f"Checkpoint 'job.{key}' must be a non-empty string.")
+
+        position = resource.get("position")
+        if not isinstance(position, dict):
+            raise ValueError("Checkpoint is missing the 'position' object.")
+        next_row_index = position.get("nextRowIndex")
+        if (
+            not isinstance(next_row_index, int)
+            or isinstance(next_row_index, bool)
+            or next_row_index < 0
+        ):
+            raise ValueError(
+                "Checkpoint 'position.nextRowIndex' must be a non-negative integer."
+            )
+        if position.get("state") not in _CHECKPOINT_POSITION_STATES:
+            raise ValueError(
+                f"Unknown checkpoint position state: {position.get('state')!r}."
+            )
+
+        schema = resource.get("schema")
+        if not isinstance(schema, dict) or not isinstance(schema.get("fields"), list):
+            raise ValueError("Checkpoint is missing a 'schema.fields' list.")
+
+    @classmethod
+    def from_dict(cls, resource: Dict[str, Any]) -> "RowCheckpoint":
+        """Factory: construct a checkpoint from a plain dict.
+
+        The input is copied and never modified.
+
+        Args:
+            resource: A checkpoint resource, such as one returned by
+                :meth:`to_dict` or loaded from persistent storage.
+
+        Returns:
+            RowCheckpoint
+
+        Raises:
+            ValueError: If the resource is not a supported checkpoint.
+        """
+        return cls(resource)
+
+    @classmethod
+    def from_json(cls, payload: str) -> "RowCheckpoint":
+        """Factory: construct a checkpoint from a JSON string.
+
+        Args:
+            payload: A JSON string, such as one produced by :meth:`to_json`.
+
+        Returns:
+            RowCheckpoint
+
+        Raises:
+            ValueError: If the payload is not valid JSON or not a supported
+                checkpoint.
+        """
+        try:
+            resource = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Checkpoint payload is not valid JSON.") from exc
+        return cls(resource)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a deep copy of the checkpoint as a JSON-compatible dict."""
+        return copy.deepcopy(self._resource)
+
+    def to_json(self, **json_kwargs: Any) -> str:
+        """Serialize the checkpoint as a JSON string.
+
+        Args:
+            json_kwargs: Extra keyword arguments passed to :func:`json.dumps`.
+
+        Returns:
+            str: The checkpoint as JSON.
+        """
+        json_kwargs.setdefault("sort_keys", True)
+        return json.dumps(self._resource, **json_kwargs)
+
+    @property
+    def version(self) -> int:
+        """int: Format version of this checkpoint."""
+        return self._resource["version"]
+
+    @property
+    def project(self) -> str:
+        """str: Project that owns the query job."""
+        return self._resource["job"]["projectId"]
+
+    @property
+    def location(self) -> str:
+        """str: Location where the query job ran."""
+        return self._resource["job"]["location"]
+
+    @property
+    def job_id(self) -> str:
+        """str: ID of the query job whose results are being read."""
+        return self._resource["job"]["jobId"]
+
+    @property
+    def next_row_index(self) -> int:
+        """int: Absolute, zero-based index of the first undelivered row."""
+        return self._resource["position"]["nextRowIndex"]
+
+    @property
+    def position_state(self) -> str:
+        """str: Where the checkpoint was taken.
+
+        One of ``"not_started"``, ``"in_page"``, ``"page_end"`` or
+        ``"exhausted"``.
+        """
+        return self._resource["position"]["state"]
+
+    @property
+    def total_rows(self) -> Optional[int]:
+        """Optional[int]: Total rows in the result set at checkpoint time."""
+        total_rows = self._resource.get("totalRows")
+        return int(total_rows) if total_rows is not None else None
+
+    @property
+    def schema(self) -> List["SchemaField"]:
+        """List[google.cloud.bigquery.schema.SchemaField]: Result schema."""
+        return list(_parse_schema_resource(self._resource["schema"]))
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, RowCheckpoint):
+            return NotImplemented
+        return self._resource == other._resource
+
+    def __ne__(self, other: Any) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        return hash(self.to_json())
+
+    def __repr__(self):
+        return (
+            f"RowCheckpoint(project={self.project!r}, location={self.location!r}, "
+            f"job_id={self.job_id!r}, next_row_index={self.next_row_index}, "
+            f"position_state={self.position_state!r}, version={self.version})"
+        )
+
+
+def _coerce_row_checkpoint(value: Any) -> Tuple[RowCheckpoint, Any]:
+    """Coerce a checkpoint-like value into a ``RowCheckpoint``.
+
+    Args:
+        value: A :class:`RowCheckpoint`, a checkpoint dict, or a JSON string.
+
+    Returns:
+        Tuple[RowCheckpoint, Any]:
+            The parsed checkpoint and the original, unmodified input value.
+
+    Raises:
+        ValueError: If the value cannot be parsed as a checkpoint.
+    """
+    if isinstance(value, RowCheckpoint):
+        return value, value
+    original = value
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Checkpoint bytes are not valid UTF-8 JSON.") from exc
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Checkpoint payload is not valid JSON.") from exc
+
+    if not isinstance(value, dict):
+        raise ValueError(
+            "Checkpoint must be a RowCheckpoint, a dict, or a JSON string; "
+            f"got {type(value).__name__}."
+        )
+
+    return RowCheckpoint.from_dict(value), original
+
+
 class RowIterator(HTTPIterator):
     """A class for iterating through HTTP/JSON API row list responses.
 
@@ -1858,6 +2197,21 @@ class RowIterator(HTTPIterator):
         self._job_started = started
         self._job_ended = ended
 
+        # Checkpoint bookkeeping. ``_iteration_mode`` is ``None`` until
+        # iteration starts, then "rows" for row-by-row iteration (the only
+        # mode that supports checkpoints) or "pages" for page iteration.
+        # ``_current_page`` is the most recently fetched page, used to tell
+        # in-page positions from page-end positions without fetching the
+        # next page. ``_used_bqstorage`` is set when results were (or are
+        # being) downloaded with the BigQuery Storage API parallel reader.
+        self._iteration_mode: Optional[str] = None
+        self._current_page = None
+        self._used_bqstorage = False
+        # Absolute index of local row 0, from the ``startIndex`` request
+        # parameter (if the iterator was built with an offset).
+        start_index = self.extra_params.get("startIndex")
+        self._start_index = int(start_index) if start_index is not None else 0
+
     @property
     def _billing_project(self) -> Optional[str]:
         """GCP Project ID where BQ API will bill to (if applicable)."""
@@ -1933,6 +2287,105 @@ class RowIterator(HTTPIterator):
     def ended(self) -> Optional[datetime.datetime]:
         """If representing query results, the end time of the associated query."""
         return self._job_ended
+
+    @property
+    def pages(self):
+        # Track how iteration was started so that create_checkpoint() can
+        # reject page-by-page consumption, whose delivered-row position is
+        # ambiguous.
+        if not self._started:
+            self._iteration_mode = "pages"
+        return super(RowIterator, self).pages
+
+    def __iter__(self):
+        if not self._started:
+            self._iteration_mode = "rows"
+        return super(RowIterator, self).__iter__()
+
+    def create_checkpoint(self) -> RowCheckpoint:
+        """Create a versioned, persistable checkpoint at the current position.
+
+        The checkpoint records the query job coordinates (project, location,
+        job ID), the absolute index of the first row that has not yet been
+        delivered, and the result schema. It can later be passed to
+        :meth:`~google.cloud.bigquery.client.Client.restore_query_rows`,
+        possibly in another process, to continue reading from that row using
+        the cached query results. The query SQL is not re-executed.
+
+        Position semantics (see ``position_state`` on the returned
+        checkpoint):
+
+        * Before iteration starts, the checkpoint points at row 0 with state
+          ``"not_started"``.
+        * After one or more rows, with rows still buffered on the current
+          page, the state is ``"in_page"``.
+        * After the last row of a page has been delivered but before the
+          next page is fetched, the state is ``"page_end"``.
+        * After the last row of the whole result set has been delivered, the
+          state is ``"exhausted"``.
+
+        This method only reads local iterator state. It does **not** fetch
+        the next page and does **not** consume or skip any rows.
+
+        Returns:
+            RowCheckpoint: A serializable checkpoint for the current
+            position.
+
+        Raises:
+            google.cloud.bigquery.exceptions.RowCheckpointError:
+                If a checkpoint cannot represent this iterator's position,
+                e.g. because it is not backed by a query job, rows are being
+                consumed page-by-page, or results are being read with the
+                BigQuery Storage API.
+
+        .. versionadded:: 3.41.0
+        """
+        if self._used_bqstorage:
+            raise bq_exceptions.RowCheckpointError(
+                "Cannot create a row checkpoint because these results are "
+                "being downloaded with the BigQuery Storage API, whose "
+                "parallel read streams do not have a single resumable row "
+                "position. Iterate the query results row-by-row over the REST "
+                "API (jobs.getQueryResults) instead."
+            )
+
+        if not self._job_id or not self._project or not self._location:
+            raise bq_exceptions.RowCheckpointError(
+                "Row checkpoints are only supported for the results of an "
+                "existing query job. This RowIterator has no associated query "
+                "job (it may have been created by Client.list_rows), so its "
+                "position cannot be resumed."
+            )
+
+        if self._iteration_mode == "pages":
+            raise bq_exceptions.RowCheckpointError(
+                "Row checkpoints require row-by-row iteration, but rows are "
+                "being consumed with the 'pages' iterator. Iterate the "
+                "RowIterator itself so the number of delivered rows is known."
+            )
+
+        next_row_index = self._start_index + self.num_results
+
+        if not self._started:
+            position_state = _CHECKPOINT_POSITION_NOT_STARTED
+        else:
+            current_page = self._current_page
+            if current_page is not None and current_page.remaining > 0:
+                position_state = _CHECKPOINT_POSITION_IN_PAGE
+            elif self.next_page_token is not None:
+                position_state = _CHECKPOINT_POSITION_PAGE_END
+            else:
+                position_state = _CHECKPOINT_POSITION_EXHAUSTED
+
+        return RowCheckpoint._from_parts(
+            project=self._project,
+            location=self._location,
+            job_id=self._job_id,
+            next_row_index=next_row_index,
+            position_state=position_state,
+            schema=self._schema,
+            total_rows=self._total_rows,
+        )
 
     def _is_almost_completely_cached(self):
         """Check if all results are completely cached.
@@ -2075,11 +2528,14 @@ class RowIterator(HTTPIterator):
         if not self._should_use_bqstorage(bqstorage_client, False):
             bqstorage_client = None
 
-        result_pages = (
-            bqstorage_download()
-            if bqstorage_client is not None
-            else tabledata_list_download()
-        )
+        if bqstorage_client is not None:
+            # Parallel Storage API reads have no single resumable row
+            # position, so checkpoints must be refused for them.
+            self._used_bqstorage = True
+            result_pages = bqstorage_download()
+        else:
+            result_pages = tabledata_list_download()
+
         yield from result_pages
 
     def to_arrow_iterable(
@@ -3826,6 +4282,10 @@ def _rows_page_start(iterator, page, response):
     # Make a (lazy) copy of the page in column-oriented format for use in data
     # science packages.
     page._columns = _row_iterator_page_columns(iterator._schema, response)
+
+    # Remember the current page so that create_checkpoint() can distinguish
+    # an in-page position from a page-end position without fetching anything.
+    iterator._current_page = page
 
     total_rows = response.get("totalRows")
     # Don't reset total_rows if it's not present in the next API response.

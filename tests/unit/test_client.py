@@ -9894,3 +9894,330 @@ def test__call_api_no_add_server_timeout_wo_timeout(client):
     client._connection = make_connection({})
     client._call_api(None, method="GET", path="/")
     client._connection.api_request.assert_called_with(method="GET", path="/")
+
+
+# ---------------------------------------------------------------------------
+# Row checkpoints: Client.restore_query_rows
+# ---------------------------------------------------------------------------
+
+_RESTORE_PROJECT = "P"
+_RESTORE_LOCATION = "US"
+_RESTORE_JOB_ID = "JOB"
+_RESTORE_SCHEMA_FIELDS = [
+    google.cloud.bigquery.SchemaField("n", "INTEGER", mode="REQUIRED")
+]
+_RESTORE_SCHEMA_RESOURCE = [{"name": "n", "type": "INTEGER", "mode": "REQUIRED"}]
+
+
+def _restore_fake_server(total_rows=10):
+    """Fake jobs.getQueryResults that honors startIndex and page tokens."""
+    calls = []
+
+    def api_request(retry, *args, method, path, query_params, **kwargs):
+        params = dict(query_params or {})
+        calls.append({"method": method, "path": path, "query_params": params})
+
+        page_token = params.get("pageToken")
+        if page_token is not None:
+            start = int(page_token.split(":", 1)[1])
+        else:
+            start = int(params.get("startIndex", 0))
+        max_results = int(params.get("maxResults", 10000))
+        end = min(start + max_results, total_rows)
+
+        response = {
+            "rows": [{"f": [{"v": str(i)}]} for i in range(start, end)],
+            "totalRows": str(total_rows),
+            "jobComplete": True,
+        }
+        if end < total_rows:
+            response["pageToken"] = f"token:{end}"
+        return response
+
+    return api_request, calls
+
+
+def _query_results_resource(total_rows="10", fields=None, complete=True):
+    from google.cloud.bigquery.query import _QueryResults
+
+    if fields is None:
+        fields = copy.deepcopy(_RESTORE_SCHEMA_RESOURCE)
+    return _QueryResults(
+        {
+            "jobComplete": complete,
+            "totalRows": total_rows,
+            "schema": {"fields": fields},
+            "jobReference": {
+                "projectId": _RESTORE_PROJECT,
+                "location": _RESTORE_LOCATION,
+                "jobId": _RESTORE_JOB_ID,
+            },
+        }
+    )
+
+
+_RESTORE_PROJECT_ID_PATH = "P:US.JOB"
+
+
+def _query_job_resource():
+    return {
+        "id": f"{_RESTORE_PROJECT_ID_PATH}",
+        "jobReference": {
+            "projectId": _RESTORE_PROJECT,
+            "location": _RESTORE_LOCATION,
+            "jobId": _RESTORE_JOB_ID,
+        },
+        "configuration": {
+            "query": {"query": "SELECT n FROM UNNEST(GENERATE_ARRAY(0, 9)) n"}
+        },
+        "state": "DONE",
+    }
+
+
+class TestRestoreQueryRows(unittest.TestCase):
+    def setUp(self):
+        from google.cloud.bigquery.job import QueryJob
+        from tests.unit.helpers import make_client
+
+        self.client = make_client(project=_RESTORE_PROJECT)
+        self.api_request, self.calls = _restore_fake_server()
+        self.client._call_api = mock.Mock(side_effect=self.api_request)
+
+        self.query_results = _query_results_resource()
+        self.get_query_results = mock.Mock(return_value=self.query_results)
+        self.client._get_query_results = self.get_query_results
+
+        self.query_job = QueryJob.from_api_repr(_query_job_resource(), self.client)
+        self.get_job = mock.Mock(return_value=self.query_job)
+        self.client.get_job = self.get_job
+
+    def _checkpoint(self, next_row_index, state, *, as_type="object"):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        cp = RowCheckpoint._from_parts(
+            project=_RESTORE_PROJECT,
+            location=_RESTORE_LOCATION,
+            job_id=_RESTORE_JOB_ID,
+            next_row_index=next_row_index,
+            position_state=state,
+            schema=_RESTORE_SCHEMA_FIELDS,
+            total_rows=10,
+        )
+        if as_type == "object":
+            return cp
+        if as_type == "dict":
+            return cp.to_dict()
+        if as_type == "json":
+            return cp.to_json()
+        if as_type == "bytes":
+            return cp.to_json().encode("utf-8")
+        raise AssertionError(as_type)
+
+    def test_resume_no_duplicates_or_gaps_across_page_sizes(self):
+        def expected_state_at(k, page_size):
+            if k == 0:
+                return "not_started"
+            if k == 10:
+                return "exhausted"
+            if k % page_size == 0:
+                return "page_end"
+            return "in_page"
+
+        cases = [
+            (0, 3, 5),
+            (1, 3, 5),
+            (3, 3, 5),
+            (4, 3, 2),
+            (6, 4, 3),
+            (9, 4, 7),
+            (10, 3, 2),
+        ]
+        for consumed, original_page_size, resume_page_size in cases:
+            with self.subTest(
+                consumed=consumed,
+                original_page_size=original_page_size,
+                resume_page_size=resume_page_size,
+            ):
+                self.setUp()  # fresh mocks/server for every combination
+
+                # Simulate the original process reading rows.
+                original = self.client._list_rows_from_query_results(
+                    _RESTORE_JOB_ID,
+                    _RESTORE_LOCATION,
+                    _RESTORE_PROJECT,
+                    _RESTORE_SCHEMA_FIELDS,
+                    total_rows=10,
+                    page_size=original_page_size,
+                )
+                delivered = [next(original).n for _ in range(consumed)]
+                self.assertEqual(delivered, list(range(consumed)))
+                checkpoint = original.create_checkpoint()
+                self.assertEqual(
+                    checkpoint.position_state,
+                    expected_state_at(consumed, original_page_size),
+                )
+                self.assertEqual(checkpoint.next_row_index, consumed)
+
+                # A new client/process resumes with a different page size.
+                calls_before_resume = len(self.calls)
+                resumed = self.client.restore_query_rows(
+                    checkpoint, page_size=resume_page_size
+                )
+                remaining = [row.n for row in resumed]
+
+                # No duplicates and no omissions across the two iterators.
+                self.assertEqual(delivered + remaining, list(range(10)))
+
+                # The resume used the cached query results at the absolute
+                # offset, not a fresh query, and honored the new page size.
+                resume_calls = self.calls[calls_before_resume:]
+                row_calls = [
+                    call
+                    for call in resume_calls
+                    if call["query_params"].get("pageToken") is None
+                ]
+                self.assertEqual(len(row_calls), 1)
+                first_params = row_calls[0]["query_params"]
+                self.assertEqual(int(first_params["startIndex"]), consumed)
+                self.assertEqual(int(first_params["maxResults"]), resume_page_size)
+                for call in resume_calls:
+                    self.assertEqual(
+                        call["path"],
+                        f"/projects/{_RESTORE_PROJECT}/queries/{_RESTORE_JOB_ID}",
+                    )
+                self.get_job.assert_called_once()
+
+    def test_resume_accepts_all_serialized_forms(self):
+        for as_type in ("object", "dict", "json", "bytes"):
+            with self.subTest(as_type=as_type):
+                self.setUp()
+                checkpoint = self._checkpoint(4, "in_page", as_type=as_type)
+                resumed = self.client.restore_query_rows(checkpoint, page_size=5)
+                self.assertEqual([row.n for row in resumed], list(range(4, 10)))
+
+    def test_resume_default_page_size(self):
+        checkpoint = self._checkpoint(8, "in_page")
+        resumed = self.client.restore_query_rows(checkpoint)
+        self.assertIsNone(resumed._page_size)
+        self.assertEqual([row.n for row in resumed], [8, 9])
+        first_params = self.calls[0]["query_params"]
+        self.assertEqual(int(first_params["startIndex"]), 8)
+        self.assertNotIn("maxResults", first_params)
+
+    def test_resume_at_end_yields_no_rows(self):
+        checkpoint = self._checkpoint(10, "exhausted")
+        resumed = self.client.restore_query_rows(checkpoint, page_size=4)
+        self.assertEqual(list(resumed), [])
+
+    def test_malformed_json_preserves_original(self):
+        original = "this is not a checkpoint"
+        with self.assertRaises(exceptions.RowCheckpointRestoreError) as caught:
+            self.client.restore_query_rows(original)
+        self.assertIs(caught.exception.checkpoint, original)
+        self.get_job.assert_not_called()
+
+    def test_future_version_preserves_original(self):
+        checkpoint = self._checkpoint(2, "in_page", as_type="dict")
+        original = copy.deepcopy(checkpoint)
+        checkpoint["version"] = 99
+
+        with self.assertRaises(exceptions.RowCheckpointRestoreError) as caught:
+            self.client.restore_query_rows(checkpoint)
+
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+        # The library neither altered the input nor "fixed" its version.
+        self.assertEqual(checkpoint["version"], 99)
+        self.assertEqual(original["version"], 1)
+        self.get_job.assert_not_called()
+
+    def test_table_source_checkpoint_rejected(self):
+        checkpoint = self._checkpoint(2, "in_page", as_type="dict")
+        checkpoint["source"] = "table"
+        with self.assertRaises(exceptions.RowCheckpointRestoreError) as caught:
+            self.client.restore_query_rows(checkpoint)
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+        self.get_job.assert_not_called()
+
+    def test_bqstorage_client_rejected_before_any_api_call(self):
+        checkpoint = self._checkpoint(2, "in_page")
+        with self.assertRaises(exceptions.RowCheckpointUnsupportedModeError) as caught:
+            self.client.restore_query_rows(
+                checkpoint, bqstorage_client=mock.sentinel.storage
+            )
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+        self.get_job.assert_not_called()
+        self.get_query_results.assert_not_called()
+
+    def test_missing_job_rejected(self):
+        self.get_job.side_effect = google.api_core.exceptions.NotFound("no such job")
+        checkpoint_json = self._checkpoint(2, "in_page", as_type="json")
+        with self.assertRaises(
+            exceptions.RowCheckpointResultsUnavailableError
+        ) as caught:
+            self.client.restore_query_rows(checkpoint_json)
+        self.assertIs(caught.exception.checkpoint, checkpoint_json)
+
+    def test_non_query_job_rejected(self):
+        from google.cloud.bigquery.job import LoadJob
+
+        load_job = LoadJob.from_api_repr(
+            {
+                "jobReference": {
+                    "projectId": _RESTORE_PROJECT,
+                    "location": _RESTORE_LOCATION,
+                    "jobId": _RESTORE_JOB_ID,
+                },
+                "configuration": {"load": {}},
+            },
+            self.client,
+        )
+        self.get_job.return_value = load_job
+
+        checkpoint = self._checkpoint(2, "in_page")
+        with self.assertRaises(exceptions.RowCheckpointUnsupportedModeError) as caught:
+            self.client.restore_query_rows(checkpoint)
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+
+    def test_expired_or_deleted_results_rejected(self):
+        self.get_query_results.side_effect = google.api_core.exceptions.NotFound(
+            "results expired"
+        )
+        checkpoint = self._checkpoint(2, "in_page")
+        with self.assertRaises(
+            exceptions.RowCheckpointResultsUnavailableError
+        ) as caught:
+            self.client.restore_query_rows(checkpoint)
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+
+    def test_incomplete_job_results_rejected(self):
+        self.get_query_results.return_value = _query_results_resource(complete=False)
+        checkpoint = self._checkpoint(2, "in_page")
+        with self.assertRaises(
+            exceptions.RowCheckpointResultsUnavailableError
+        ) as caught:
+            self.client.restore_query_rows(checkpoint)
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+
+    def test_schema_mismatch_rejected_and_preserved(self):
+        self.get_query_results.return_value = _query_results_resource(
+            fields=[{"name": "different", "type": "STRING", "mode": "NULLABLE"}]
+        )
+        checkpoint_dict = self._checkpoint(2, "in_page", as_type="dict")
+        original = copy.deepcopy(checkpoint_dict)
+
+        with self.assertRaises(exceptions.RowCheckpointSchemaMismatchError) as caught:
+            self.client.restore_query_rows(checkpoint_dict)
+
+        self.assertIs(caught.exception.checkpoint, checkpoint_dict)
+        self.assertEqual(checkpoint_dict, original)
+        self.assertEqual(self.calls, [])  # no rows fetched
+
+    def test_position_beyond_result_set_rejected(self):
+        self.get_query_results.return_value = _query_results_resource(total_rows="3")
+        checkpoint = self._checkpoint(4, "in_page")
+        with self.assertRaises(
+            exceptions.RowCheckpointResultsUnavailableError
+        ) as caught:
+            self.client.restore_query_rows(checkpoint)
+        self.assertIs(caught.exception.checkpoint, checkpoint)
+        self.assertEqual(self.calls, [])

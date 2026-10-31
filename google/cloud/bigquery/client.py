@@ -119,7 +119,10 @@ from google.cloud.bigquery.retry import (
 )
 from google.cloud.bigquery.routine import Routine
 from google.cloud.bigquery.routine import RoutineReference
+from google.cloud.bigquery.schema import _build_schema_resource
 from google.cloud.bigquery.schema import SchemaField
+from google.cloud.bigquery.table import _coerce_row_checkpoint
+from google.cloud.bigquery.table import RowCheckpoint
 from google.cloud.bigquery.table import _table_arg_to_table
 from google.cloud.bigquery.table import _table_arg_to_table_ref
 from google.cloud.bigquery.table import Table
@@ -4323,6 +4326,193 @@ class Client(ClientWithProject):
             ended=ended,
         )
         return row_iterator
+
+    def restore_query_rows(
+        self,
+        checkpoint: Union[RowCheckpoint, Dict[str, Any], str, bytes],
+        *,
+        page_size: Optional[int] = None,
+        retry: retries.Retry = DEFAULT_RETRY,
+        timeout: TimeoutType = DEFAULT_TIMEOUT,
+        bqstorage_client: Optional[Any] = None,
+    ) -> RowIterator:
+        """Resume reading query results from a row checkpoint.
+
+        Continues iterating the results of the *existing* query job recorded
+        in ``checkpoint``, starting at the checkpoint's first undelivered
+        row. The original query SQL is not re-executed; rows are read from
+        the cached query results via ``jobs.getQueryResults`` using the
+        checkpoint's absolute row index. The ``page_size`` of the resumed
+        iteration may differ from the original iteration's page size.
+
+        Args:
+            checkpoint:
+                A checkpoint produced by
+                :meth:`~google.cloud.bigquery.table.RowIterator.create_checkpoint`,
+                as a :class:`~google.cloud.bigquery.table.RowCheckpoint`,
+                a dict, or a JSON string/bytes (e.g. loaded in another
+                process).
+            page_size (Optional[int]):
+                The maximum number of rows in each page of the resumed
+                iteration. Non-positive values are ignored. May differ from
+                the page size used when the checkpoint was created.
+            retry (Optional[google.api_core.retry.Retry]):
+                How to retry the metadata and row fetch RPCs.
+            timeout (Optional[float]):
+                The number of seconds to wait for each underlying API call.
+            bqstorage_client:
+                Must be :data:`None`. Resuming with the BigQuery Storage API
+                parallel reader is not supported and raises.
+
+        Returns:
+            google.cloud.bigquery.table.RowIterator:
+                Iterator of the remaining rows, starting at the checkpoint
+                position.
+
+        Raises:
+            google.cloud.bigquery.exceptions.RowCheckpointRestoreError:
+                If the checkpoint is malformed or cannot be used. The
+                original, unmodified checkpoint is preserved on the
+                exception's ``checkpoint`` attribute. Subclasses indicate
+                the specific reason:
+
+                * :class:`~google.cloud.bigquery.exceptions.RowCheckpointResultsUnavailableError`:
+                  the referenced query job no longer exists, its cached
+                  results have expired or been deleted, the job is not yet
+                  complete, or the checkpoint position is past the end of
+                  the result set.
+                * :class:`~google.cloud.bigquery.exceptions.RowCheckpointSchemaMismatchError`:
+                  the current result schema differs from the schema recorded
+                  in the checkpoint.
+                * :class:`~google.cloud.bigquery.exceptions.RowCheckpointUnsupportedModeError`:
+                  the checkpoint does not reference a query job (e.g. it
+                  came from ``tabledata.list``) or a BigQuery Storage API
+                  client was supplied.
+
+        .. versionadded:: 3.41.0
+        """
+        try:
+            checkpoint_obj, original_checkpoint = _coerce_row_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise bq_exceptions.RowCheckpointRestoreError(
+                f"Cannot restore rows from the checkpoint: {exc} The original "
+                "checkpoint is unchanged.",
+                checkpoint=checkpoint,
+            ) from exc
+
+        if bqstorage_client is not None:
+            raise bq_exceptions.RowCheckpointUnsupportedModeError(
+                "Cannot resume a row checkpoint with the BigQuery Storage API: "
+                "parallel read streams do not have a single resumable row "
+                "position. Resume without a bqstorage_client. The original "
+                "checkpoint is unchanged.",
+                checkpoint=original_checkpoint,
+            )
+
+        project = checkpoint_obj.project
+        location = checkpoint_obj.location
+        job_id = checkpoint_obj.job_id
+
+        # Confirm the referenced job still exists and is actually a query
+        # job. This never re-runs the query (jobs.get is metadata only).
+        try:
+            query_job = self.get_job(
+                job_id,
+                project=project,
+                location=location,
+                retry=retry,
+                timeout=timeout,
+            )
+        except core_exceptions.NotFound as exc:
+            raise bq_exceptions.RowCheckpointResultsUnavailableError(
+                f"The query job {project}.{location}.{job_id} referenced by "
+                "the checkpoint was not found, so its results cannot be "
+                "resumed. The original checkpoint is unchanged.",
+                checkpoint=original_checkpoint,
+            ) from exc
+
+        if not isinstance(query_job, QueryJob):
+            raise bq_exceptions.RowCheckpointUnsupportedModeError(
+                f"Job {project}.{location}.{job_id} is a "
+                f"{type(query_job).__name__}, not a query job. Only query job "
+                "results can be resumed from a row checkpoint. The original "
+                "checkpoint is unchanged.",
+                checkpoint=original_checkpoint,
+            )
+
+        # Fetch result metadata only (maxResults=0 means no rows are
+        # returned). This verifies the cached results are still available
+        # and gives us the authoritative schema and row count.
+        try:
+            query_results = self._get_query_results(
+                job_id,
+                retry,
+                project=project,
+                location=location,
+                page_size=0,
+                timeout=timeout,
+            )
+        except core_exceptions.NotFound as exc:
+            raise bq_exceptions.RowCheckpointResultsUnavailableError(
+                f"The cached results of query job "
+                f"{project}.{location}.{job_id} have expired or been deleted, "
+                "so iteration cannot be resumed. The original checkpoint is "
+                "unchanged.",
+                checkpoint=original_checkpoint,
+            ) from exc
+
+        if not query_results.complete:
+            raise bq_exceptions.RowCheckpointResultsUnavailableError(
+                f"Query job {project}.{location}.{job_id} is not complete, so "
+                "its results cannot be resumed from a checkpoint. The "
+                "original checkpoint is unchanged.",
+                checkpoint=original_checkpoint,
+            )
+
+        checkpoint_schema = _build_schema_resource(checkpoint_obj.schema)
+        current_schema = _build_schema_resource(query_results.schema)
+        if checkpoint_schema != current_schema:
+            raise bq_exceptions.RowCheckpointSchemaMismatchError(
+                "The schema of the current query results does not match the "
+                "schema recorded in the checkpoint, so resuming could skip or "
+                "misinterpret rows. The original checkpoint is unchanged.",
+                checkpoint=original_checkpoint,
+            )
+
+        total_rows = query_results.total_rows
+        next_row_index = checkpoint_obj.next_row_index
+        if total_rows is not None and next_row_index > total_rows:
+            raise bq_exceptions.RowCheckpointResultsUnavailableError(
+                f"The checkpoint resumes at row {next_row_index}, but the "
+                f"current result set has only {total_rows} rows. The cached "
+                "results may have expired or changed. The original checkpoint "
+                "is unchanged.",
+                checkpoint=original_checkpoint,
+            )
+
+        # Build a plain getQueryResults iterator at the checkpoint offset.
+        # No first_page_response is supplied, so the first request carries
+        # startIndex=next_row_index, reading from the cached results instead
+        # of executing any SQL.
+        return self._list_rows_from_query_results(
+            job_id,
+            location,
+            project,
+            query_results.schema,
+            total_rows=total_rows,
+            destination=query_job.destination,
+            start_index=next_row_index,
+            page_size=page_size,
+            retry=retry,
+            timeout=timeout,
+            first_page_response=None,
+            query=query_job.query,
+            total_bytes_processed=query_job.total_bytes_processed,
+            slot_millis=query_job.slot_millis,
+            created=query_job.created,
+            started=query_job.started,
+            ended=query_job.ended,
+        )
 
     def _schema_from_json_file_object(self, file_obj):
         """Helper function for schema_from_json that takes a

@@ -46,6 +46,11 @@ from google.cloud.bigquery.enums import StandardSqlTypeNames
 from google.cloud.bigquery.exceptions import LegacyBigQueryStorageError
 from google.cloud.bigquery.exceptions import LegacyPandasError
 from google.cloud.bigquery.exceptions import LegacyPyarrowError
+from google.cloud.bigquery.exceptions import RowCheckpointError
+from google.cloud.bigquery.exceptions import RowCheckpointRestoreError
+from google.cloud.bigquery.exceptions import RowCheckpointResultsUnavailableError
+from google.cloud.bigquery.exceptions import RowCheckpointSchemaMismatchError
+from google.cloud.bigquery.exceptions import RowCheckpointUnsupportedModeError
 from google.cloud.bigquery.external_config import ExternalConfig
 from google.cloud.bigquery.external_config import BigtableOptions
 from google.cloud.bigquery.external_config import BigtableColumnFamily
@@ -109,6 +114,7 @@ from google.cloud.bigquery.standard_sql import StandardSqlTableType
 from google.cloud.bigquery.table import PartitionRange
 from google.cloud.bigquery.table import RangePartitioning
 from google.cloud.bigquery.table import Row
+from google.cloud.bigquery.table import RowCheckpoint
 from google.cloud.bigquery.table import SnapshotDefinition
 from google.cloud.bigquery.table import CloneDefinition
 from google.cloud.bigquery.table import Table
@@ -161,6 +167,7 @@ __all__ = [
     "PartitionRange",
     "RangePartitioning",
     "Row",
+    "RowCheckpoint",
     "SnapshotDefinition",
     "CloneDefinition",
     "TimePartitioning",
@@ -231,6 +238,11 @@ __all__ = [
     "LegacyBigQueryStorageError",
     "LegacyPyarrowError",
     "LegacyPandasError",
+    "RowCheckpointError",
+    "RowCheckpointRestoreError",
+    "RowCheckpointResultsUnavailableError",
+    "RowCheckpointSchemaMismatchError",
+    "RowCheckpointUnsupportedModeError",
 ]
 
 

@@ -6897,3 +6897,376 @@ def test_to_dataframe_iterable_w_bqstorage_max_stream_count(preserve_order):
         retry=None,
         timeout=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Row checkpoints
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_SCHEMA = [schema.SchemaField("n", "INTEGER", mode="REQUIRED")]
+
+
+def _fake_query_results_api(total_rows=10, default_page_size=10000):
+    """A fake jobs.getQueryResults paged API.
+
+    Honors startIndex on the first request and opaque page tokens afterwards.
+    Returns (api_request_callable, calls_record).
+    """
+    calls = []
+
+    def api_request(*, method, path, query_params, **kwargs):
+        params = dict(query_params or {})
+        calls.append({"method": method, "path": path, "query_params": params})
+
+        page_token = params.get("pageToken")
+        if page_token is not None:
+            start = int(page_token.split(":", 1)[1])
+        else:
+            start = int(params.get("startIndex", 0))
+
+        max_results = int(params.get("maxResults", default_page_size))
+        end = min(start + max_results, total_rows)
+
+        response = {
+            "rows": [{"f": [{"v": str(i)}]} for i in range(start, end)],
+            "totalRows": str(total_rows),
+            "jobComplete": True,
+        }
+        if end < total_rows:
+            response["pageToken"] = f"token:{end}"
+        return response
+
+    return api_request, calls
+
+
+def _make_query_rows(api_request, *, page_size=None, start_index=None, total_rows=10):
+    """Build a RowIterator the way Client._list_rows_from_query_results does."""
+    from google.cloud.bigquery import table as mut
+
+    extra_params = {
+        "fields": "jobs(queryResults)",
+        "location": "US",
+        "formatOptions.useInt64Timestamp": True,
+    }
+    if start_index is not None:
+        extra_params["startIndex"] = start_index
+
+    return mut.RowIterator(
+        _mock_client(),
+        api_request,
+        path="/projects/P/queries/JOB",
+        schema=_CHECKPOINT_SCHEMA,
+        page_size=page_size,
+        extra_params=extra_params,
+        project="P",
+        location="US",
+        job_id="JOB",
+        total_rows=total_rows,
+    )
+
+
+def _make_table_rows(api_request, *, page_size=None):
+    """Build a RowIterator the way Client.list_rows does (no query job)."""
+    from google.cloud.bigquery import table as mut
+
+    return mut.RowIterator(
+        _mock_client(),
+        api_request,
+        path="/projects/P/datasets/D/tables/T/data",
+        schema=_CHECKPOINT_SCHEMA,
+        page_size=page_size,
+        extra_params={},
+        table=TableReference.from_string("P.D.T"),
+        project="P",
+    )
+
+
+class TestRowCheckpointSerialization(unittest.TestCase):
+    @staticmethod
+    def _make_checkpoint(**overrides):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        resource = {
+            "type": "google-cloud-bigquery#rowCheckpoint",
+            "version": 1,
+            "source": "query_job",
+            "iterationMode": "rows",
+            "job": {"projectId": "P", "location": "US", "jobId": "JOB"},
+            "position": {"nextRowIndex": 4, "state": "in_page"},
+            "schema": {
+                "fields": [{"name": "n", "type": "INTEGER", "mode": "REQUIRED"}]
+            },
+            "totalRows": 10,
+        }
+        resource.update(overrides)
+        return RowCheckpoint.from_dict(resource)
+
+    def test_roundtrip_dict_and_properties(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        cp = self._make_checkpoint()
+        self.assertEqual(cp.version, 1)
+        self.assertEqual(cp.project, "P")
+        self.assertEqual(cp.location, "US")
+        self.assertEqual(cp.job_id, "JOB")
+        self.assertEqual(cp.next_row_index, 4)
+        self.assertEqual(cp.position_state, "in_page")
+        self.assertEqual(cp.total_rows, 10)
+        self.assertEqual(cp.schema, _CHECKPOINT_SCHEMA)
+
+        resource = cp.to_dict()
+        self.assertEqual(RowCheckpoint.from_dict(resource), cp)
+
+    def test_roundtrip_json_and_bytes(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        cp = self._make_checkpoint()
+        payload = cp.to_json()
+        self.assertIsInstance(payload, str)
+        self.assertEqual(RowCheckpoint.from_json(payload), cp)
+        self.assertEqual(RowCheckpoint.from_json(payload.encode("utf-8")), cp)
+
+    def test_pickle_roundtrip(self):
+        import pickle
+
+        cp = self._make_checkpoint()
+        self.assertEqual(pickle.loads(pickle.dumps(cp)), cp)
+
+    def test_input_dict_is_copied_and_not_modified(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        resource = self._make_checkpoint().to_dict()
+        cp = RowCheckpoint.from_dict(resource)
+        # Mutating the input must not affect the parsed checkpoint.
+        resource["position"]["nextRowIndex"] = 999
+        self.assertEqual(cp.next_row_index, 4)
+        self.assertNotEqual(cp.to_dict()["position"]["nextRowIndex"], 999)
+
+    def test_invalid_resources_rejected(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        mutations = [
+            lambda r: r.pop("type"),
+            lambda r: r.update(type="nope"),
+            lambda r: r.update(version=2),
+            lambda r: r.update(version=0),
+            lambda r: r.update(version="1"),
+            lambda r: r.update(source="table"),
+            lambda r: r.update(iterationMode="storage_streams"),
+            lambda r: r["job"].pop("jobId"),
+            lambda r: r["job"].update(location=""),
+            lambda r: r["position"].update(nextRowIndex=-1),
+            lambda r: r["position"].update(nextRowIndex="3"),
+            lambda r: r["position"].update(state="halfway"),
+            lambda r: r.pop("schema"),
+        ]
+        for mutate in mutations:
+            resource = self._make_checkpoint().to_dict()
+            mutate(resource)
+            with self.assertRaises(ValueError):
+                RowCheckpoint.from_dict(resource)
+
+    def test_invalid_json_rejected(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        with self.assertRaises(ValueError):
+            RowCheckpoint.from_json("not json")
+
+    def test_repr(self):
+        cp = self._make_checkpoint()
+        self.assertIn("JOB", repr(cp))
+        self.assertIn("next_row_index=4", repr(cp))
+        self.assertIn("in_page", repr(cp))
+
+
+class TestRowIteratorCreateCheckpoint(unittest.TestCase):
+    def test_before_iteration(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        cp = rows.create_checkpoint()
+
+        self.assertEqual(cp.position_state, "not_started")
+        self.assertEqual(cp.next_row_index, 0)
+        self.assertEqual(cp.project, "P")
+        self.assertEqual(cp.location, "US")
+        self.assertEqual(cp.job_id, "JOB")
+        self.assertEqual(cp.schema, _CHECKPOINT_SCHEMA)
+        self.assertEqual(cp.total_rows, 10)
+        # Taking the checkpoint must not prefetch anything.
+        self.assertEqual(calls, [])
+
+    def test_in_page_does_not_prefetch_or_consume(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        row = next(rows)
+        self.assertEqual(row.n, 0)
+        self.assertEqual(len(calls), 1)
+
+        cp = rows.create_checkpoint()
+
+        self.assertEqual(cp.position_state, "in_page")
+        self.assertEqual(cp.next_row_index, 1)
+        # Still exactly one API call: the checkpoint did not fetch page 2.
+        self.assertEqual(len(calls), 1)
+
+        # The checkpoint did not consume the buffered next row.
+        self.assertEqual(next(rows).n, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(next(rows).n, 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_page_end_position(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        seen = [next(rows).n for _ in range(3)]
+        self.assertEqual(seen, [0, 1, 2])
+        self.assertEqual(len(calls), 1)
+
+        cp = rows.create_checkpoint()
+
+        self.assertEqual(cp.position_state, "page_end")
+        self.assertEqual(cp.next_row_index, 3)
+        # No speculative fetch of page 2.
+        self.assertEqual(len(calls), 1)
+
+        # Resuming locally delivers the first row of page 2 and only then
+        # fetches it.
+        self.assertEqual(next(rows).n, 3)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["query_params"].get("pageToken"), "token:3")
+
+    def test_in_page_after_page_break(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        seen = [next(rows).n for _ in range(4)]
+        self.assertEqual(seen, [0, 1, 2, 3])
+        self.assertEqual(len(calls), 2)
+
+        cp = rows.create_checkpoint()
+        self.assertEqual(cp.position_state, "in_page")
+        self.assertEqual(cp.next_row_index, 4)
+
+    def test_exhausted_position(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        seen = [row.n for row in rows]
+        self.assertEqual(seen, list(range(10)))
+
+        cp = rows.create_checkpoint()
+        self.assertEqual(cp.position_state, "exhausted")
+        self.assertEqual(cp.next_row_index, 10)
+
+    def test_start_index_offset_uses_absolute_position(self):
+        api_request, calls = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3, start_index=5)
+
+        self.assertEqual(rows.create_checkpoint().position_state, "not_started")
+        next(rows)
+        next(rows)
+        cp = rows.create_checkpoint()
+        self.assertEqual(cp.position_state, "in_page")
+        self.assertEqual(cp.next_row_index, 7)
+
+    def test_reject_table_list_rows_iterator(self):
+        api_request, _ = _fake_query_results_api()
+        rows = _make_table_rows(api_request)
+
+        with self.assertRaises(exceptions.RowCheckpointError):
+            rows.create_checkpoint()
+
+        # Also reject once table iteration has started.
+        list(rows)
+        with self.assertRaises(exceptions.RowCheckpointError):
+            rows.create_checkpoint()
+
+    def test_reject_pages_iteration(self):
+        api_request, _ = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        pages = rows.pages
+        next(pages)
+        with self.assertRaises(exceptions.RowCheckpointError):
+            rows.create_checkpoint()
+
+    def test_reject_bqstorage_mode(self):
+        api_request, _ = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+
+        def storage_pages():
+            yield ["storage-page-1"]
+
+        # Force the Storage API branch of _to_page_iterable.
+        with mock.patch.object(type(rows), "_should_use_bqstorage", return_value=True):
+            list(rows._to_page_iterable(storage_pages, lambda: iter([]), object()))
+
+        self.assertTrue(rows._used_bqstorage)
+        with self.assertRaises(exceptions.RowCheckpointError):
+            rows.create_checkpoint()
+
+    def test_checkpoint_is_json_serializable_with_nested_schema(self):
+        from google.cloud.bigquery.table import RowCheckpoint
+
+        nested_schema = [
+            schema.SchemaField(
+                "outer",
+                "RECORD",
+                mode="REPEATED",
+                fields=[schema.SchemaField("inner", "STRING", mode="NULLABLE")],
+            )
+        ]
+        api_request, _ = _fake_query_results_api()
+        rows = _make_query_rows(api_request, page_size=3)
+        rows._schema = tuple(nested_schema)
+
+        cp = rows.create_checkpoint()
+        rebuilt = RowCheckpoint.from_json(cp.to_json())
+        self.assertEqual(rebuilt, cp)
+        self.assertEqual(rebuilt.schema, nested_schema)
+
+
+def test_checkpoint_cross_process_deserialization(tmp_path):
+    """A checkpoint JSON written by one process is usable in another."""
+    import os
+    import subprocess
+    import sys
+
+    api_request, _ = _fake_query_results_api()
+    rows = _make_query_rows(api_request, page_size=3)
+    for _ in range(4):
+        next(rows)
+    checkpoint = rows.create_checkpoint()
+    assert checkpoint.position_state == "in_page"
+
+    payload_path = tmp_path / "checkpoint.json"
+    payload_path.write_text(checkpoint.to_json(), encoding="utf-8")
+
+    code = (
+        "import sys; "
+        "from google.cloud.bigquery.table import RowCheckpoint; "
+        "cp = RowCheckpoint.from_json(open(sys.argv[1], encoding='utf-8').read()); "
+        "assert cp.job_id == 'JOB'; "
+        "assert cp.project == 'P'; "
+        "assert cp.location == 'US'; "
+        "assert cp.next_row_index == 4; "
+        "assert cp.position_state == 'in_page'; "
+        "assert [f.name for f in cp.schema] == ['n']; "
+        "print('CHECKPOINT_OK')"
+    )
+    env = dict(os.environ)
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(payload_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CHECKPOINT_OK" in result.stdout
