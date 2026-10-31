@@ -34,6 +34,7 @@ from google.cloud.bigquery import version as bigquery_version
 __version__ = bigquery_version.__version__
 
 from google.cloud.bigquery.client import Client
+from google.cloud.bigquery.client import InsertRowsBatchResult
 from google.cloud.bigquery.dataset import AccessEntry
 from google.cloud.bigquery.dataset import Dataset
 from google.cloud.bigquery.dataset import DatasetReference
@@ -138,6 +139,7 @@ if sys_major == 3 and sys_minor in (7, 8):
 __all__ = [
     "__version__",
     "Client",
+    "InsertRowsBatchResult",
     # Queries
     "ConnectionProperty",
     "QueryJob",

@@ -6753,6 +6753,505 @@ class TestClient(unittest.TestCase):
         with self.assertRaises(TypeError):
             client.insert_rows_json(table, ROW)
 
+    def _make_insert_rows_json_iterator_client(self, *responses):
+        creds = _make_credentials()
+        http = object()
+        client = self._make_one(project="PROJECT", credentials=creds, _http=http)
+        client._connection = make_connection(*responses)
+        return client
+
+    def _tracking_iterator(self, rows):
+        # Wrap rows in an iterator that records how often next() was called,
+        # so tests can assert the input is not read ahead unboundedly.
+        pulled = []
+
+        def _gen():
+            for row in rows:
+                pulled.append(row)
+                yield row
+
+        return _gen(), pulled
+
+    def test_insert_rows_json_iterator_default_uuid_single_batch(self):
+        from google.cloud.bigquery import InsertRowsBatchResult
+        from google.cloud.bigquery.client import _insertall_json_size
+
+        rows = [{"col1": "val1"}, {"col2": "val2"}]
+        client = self._make_insert_rows_json_iterator_client({})
+        conn = client._connection
+
+        with mock.patch("uuid.uuid4", side_effect=map(str, range(len(rows)))):
+            results = list(
+                client.insert_rows_json_iterator(
+                    "proj.dset.tbl", iter(rows), max_rows_per_batch=10
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertIsInstance(result, InsertRowsBatchResult)
+        self.assertEqual(result.index, 0)
+        self.assertEqual(result.row_count, 2)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(result.sent)
+
+        expected_data = {
+            "rows": [
+                {"json": {"col1": "val1"}, "insertId": "0"},
+                {"json": {"col2": "val2"}, "insertId": "1"},
+            ]
+        }
+        conn.api_request.assert_called_once_with(
+            method="POST",
+            path="/projects/proj/datasets/dset/tables/tbl/insertAll",
+            data=expected_data,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        # The reported byte size is exactly the UTF-8 size of the JSON sent.
+        self.assertEqual(result.request_bytes, _insertall_json_size(expected_data))
+
+    def test_insert_rows_json_iterator_empty_input_makes_no_request(self):
+        client = self._make_insert_rows_json_iterator_client({})
+        conn = client._connection
+
+        results = list(client.insert_rows_json_iterator("proj.dset.tbl", iter(())))
+
+        self.assertEqual(results, [])
+        conn.api_request.assert_not_called()
+
+    def test_insert_rows_json_iterator_splits_by_max_rows(self):
+        from google.cloud.bigquery import AutoRowIDs
+        from google.cloud.bigquery.client import _insertall_json_size
+
+        rows = [{"col": str(i)} for i in range(5)]
+        client = self._make_insert_rows_json_iterator_client({}, {}, {})
+        conn = client._connection
+
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                max_rows_per_batch=2,
+            )
+        )
+
+        self.assertEqual([r.index for r in results], [0, 2, 4])
+        self.assertEqual([r.row_count for r in results], [2, 2, 1])
+        self.assertTrue(all(r.sent for r in results))
+        self.assertEqual(conn.api_request.call_count, 3)
+
+        sent_data = [call.kwargs["data"] for call in conn.api_request.call_args_list]
+        self.assertEqual(
+            [[entry["json"] for entry in batch["rows"]] for batch in sent_data],
+            [[rows[0], rows[1]], [rows[2], rows[3]], [rows[4]]],
+        )
+        for result, data in zip(results, sent_data):
+            self.assertEqual(result.request_bytes, _insertall_json_size(data))
+
+    def test_insert_rows_json_iterator_byte_budget_boundary(self):
+        from google.cloud.bigquery import AutoRowIDs
+        from google.cloud.bigquery.client import _insertall_json_size
+
+        rows = [{"a": "1"}, {"a": "22"}, {"a": "333"}]
+
+        def entry(row):
+            return {"json": row, "insertId": None}
+
+        overhead = _insertall_json_size({"rows": []})
+        two_row_size = (
+            overhead
+            + _insertall_json_size(entry(rows[0]))
+            + 2
+            + _insertall_json_size(entry(rows[1]))
+        )
+
+        # A budget exactly as large as the two-row request keeps both rows in
+        # one batch, but one byte less forces a split.
+        client = self._make_insert_rows_json_iterator_client({}, {})
+        results_exact = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                max_bytes_per_batch=two_row_size,
+            )
+        )
+        self.assertEqual([r.row_count for r in results_exact], [2, 1])
+        self.assertEqual([r.index for r in results_exact], [0, 2])
+
+        client = self._make_insert_rows_json_iterator_client({}, {}, {})
+        results_tight = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                max_bytes_per_batch=two_row_size - 1,
+            )
+        )
+        self.assertEqual([r.row_count for r in results_tight], [1, 1, 1])
+        self.assertEqual([r.index for r in results_tight], [0, 1, 2])
+
+        # Every request actually stays within the configured budget.
+        for call in client._connection.api_request.call_args_list:
+            self.assertLessEqual(
+                _insertall_json_size(call.kwargs["data"]), two_row_size - 1
+            )
+
+    def test_insert_rows_json_iterator_multibyte_bytes(self):
+        from google.cloud.bigquery import AutoRowIDs
+        from google.cloud.bigquery.client import _insertall_json_size
+
+        # Non-ASCII characters (BMP and astral planes) are escaped by
+        # json.dumps(ensure_ascii=True), but the reported size must still be
+        # the exact UTF-8 size of the serialized request.
+        rows = [
+            {"name": "\u4e2d\u6587"},  # CJK, BMP
+            {"name": "\U0001f600"},  # emoji, astral plane -> surrogate pair
+            {"name": "ascii"},
+        ]
+        client = self._make_insert_rows_json_iterator_client({}, {}, {})
+
+        first_entry_size = _insertall_json_size({"json": rows[0], "insertId": None})
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                # Force the CJK row into its own batch by allowing its request
+                # but not that request plus another row.
+                max_bytes_per_batch=first_entry_size
+                + _insertall_json_size({"rows": []}),
+            )
+        )
+
+        self.assertEqual([r.row_count for r in results], [1, 1, 1])
+        for result, call in zip(results, client._connection.api_request.call_args_list):
+            serialized = json.dumps(call.kwargs["data"]).encode("utf-8")
+            self.assertEqual(result.request_bytes, len(serialized))
+
+    def test_insert_rows_json_iterator_partial_failure_uses_global_index(self):
+        rows = [{"col": str(i)} for i in range(5)]
+        responses = [
+            {
+                "insertErrors": [
+                    {"index": 0, "errors": [{"reason": "invalid", "message": "e0"}]},
+                    {"index": 1, "errors": [{"reason": "invalid", "message": "e1"}]},
+                ]
+            },
+            {
+                "insertErrors": [
+                    {"index": 1, "errors": [{"reason": "invalid", "message": "e3"}]}
+                ]
+            },
+            {},
+        ]
+        client = self._make_insert_rows_json_iterator_client(*responses)
+
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl", iter(rows), max_rows_per_batch=2
+            )
+        )
+
+        self.assertEqual([r.index for r in results], [0, 2, 4])
+        self.assertEqual([error["index"] for error in results[0].errors], [0, 1])
+        # In-batch index 1 of the second batch is global index 3.
+        self.assertEqual([error["index"] for error in results[1].errors], [3])
+        self.assertEqual(results[2].errors, [])
+
+    def test_insert_rows_json_iterator_custom_row_ids_iterator(self):
+        rows = [{"col": str(i)} for i in range(4)]
+        row_ids = iter(["id-0", "id-1", "id-2", "id-3"])
+        client = self._make_insert_rows_json_iterator_client({}, {})
+
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=row_ids,
+                max_rows_per_batch=2,
+            )
+        )
+
+        self.assertEqual(len(results), 2)
+        sent_batches = [
+            call.kwargs["data"]["rows"]
+            for call in client._connection.api_request.call_args_list
+        ]
+        self.assertEqual(
+            [[entry["insertId"] for entry in batch] for batch in sent_batches],
+            [["id-0", "id-1"], ["id-2", "id-3"]],
+        )
+
+    def test_insert_rows_json_iterator_too_few_row_ids(self):
+        rows = [{"col": "1"}, {"col": "2"}]
+        client = self._make_insert_rows_json_iterator_client({})
+
+        gen = client.insert_rows_json_iterator(
+            "proj.dset.tbl", iter(rows), row_ids=iter(["only-id"])
+        )
+        with self.assertRaisesRegex(
+            ValueError, "row_ids did not generate enough IDs.*index 1"
+        ):
+            list(gen)
+
+        client._connection.api_request.assert_not_called()
+
+    def test_insert_rows_json_iterator_non_iterable_row_ids(self):
+        client = self._make_insert_rows_json_iterator_client({})
+
+        with self.assertRaises(TypeError) as exc:
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl", iter([{"col": "1"}]), row_ids=object()
+            )
+
+        self.assertIn("row_ids", str(exc.exception))
+        self.assertIn("iterable", str(exc.exception))
+
+    def test_insert_rows_json_iterator_options_preserved_per_batch(self):
+        from google.cloud.bigquery import AutoRowIDs
+
+        rows = [{"col": "1"}, {"col": "2"}, {"col": "3"}]
+        client = self._make_insert_rows_json_iterator_client({}, {})
+
+        list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                skip_invalid_rows=True,
+                ignore_unknown_values=True,
+                template_suffix="_suffix",
+                max_rows_per_batch=2,
+            )
+        )
+
+        for call in client._connection.api_request.call_args_list:
+            data = call.kwargs["data"]
+            self.assertTrue(data["skipInvalidRows"])
+            self.assertTrue(data["ignoreUnknownValues"])
+            self.assertEqual(data["templateSuffix"], "_suffix")
+            self.assertTrue(all(entry["insertId"] is None for entry in data["rows"]))
+
+    def test_insert_rows_json_iterator_oversized_row_not_sent(self):
+        from google.cloud.bigquery import AutoRowIDs
+        from google.cloud.bigquery.client import (
+            _INSERTALL_ROW_TOO_LARGE_REASON,
+            _insertall_json_size,
+        )
+
+        rows = [
+            {"col": "small-0"},
+            {"col": "x" * 200},
+            {"col": "small-2"},
+        ]
+        client = self._make_insert_rows_json_iterator_client({}, {})
+
+        oversized_size = _insertall_json_size({"rows": []}) + _insertall_json_size(
+            {"json": rows[1], "insertId": None}
+        )
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                # The big row cannot fit on its own, the small rows can.
+                max_bytes_per_batch=oversized_size - 1,
+            )
+        )
+
+        self.assertEqual(len(results), 3)
+        sent_before, oversized, sent_after = results
+
+        # Previously accumulated rows are flushed as a normal batch.
+        self.assertTrue(sent_before.sent)
+        self.assertEqual(sent_before.index, 0)
+        self.assertEqual(sent_before.row_count, 1)
+
+        # The oversized row is reported explicitly and never sent.
+        self.assertFalse(oversized.sent)
+        self.assertEqual(oversized.index, 1)
+        self.assertEqual(oversized.row_count, 1)
+        self.assertEqual(oversized.request_bytes, oversized_size)
+        error = oversized.errors[0]
+        self.assertEqual(error["index"], 1)
+        self.assertEqual(error["errors"][0]["reason"], _INSERTALL_ROW_TOO_LARGE_REASON)
+        self.assertEqual(error["errors"][0]["maximumBytes"], oversized_size - 1)
+        self.assertEqual(error["errors"][0]["actualBytes"], oversized_size)
+        self.assertIn("not sent", error["errors"][0]["message"])
+
+        # Processing continues with the rows after the oversized one.
+        self.assertTrue(sent_after.sent)
+        self.assertEqual(sent_after.index, 2)
+        self.assertEqual(sent_after.row_count, 1)
+
+        self.assertEqual(client._connection.api_request.call_count, 2)
+        sent_payloads = [
+            call.kwargs["data"]["rows"]
+            for call in client._connection.api_request.call_args_list
+        ]
+        self.assertEqual(
+            [[entry["json"] for entry in batch] for batch in sent_payloads],
+            [[rows[0]], [rows[2]]],
+        )
+
+    def test_insert_rows_json_iterator_first_row_oversized(self):
+        from google.cloud.bigquery import AutoRowIDs
+        from google.cloud.bigquery.client import _insertall_json_size
+
+        rows = [{"col": "x" * 100}, {"col": "ok"}]
+        client = self._make_insert_rows_json_iterator_client({})
+
+        oversized_size = _insertall_json_size({"rows": []}) + _insertall_json_size(
+            {"json": rows[0], "insertId": None}
+        )
+        results = list(
+            client.insert_rows_json_iterator(
+                "proj.dset.tbl",
+                iter(rows),
+                row_ids=AutoRowIDs.DISABLED,
+                max_bytes_per_batch=oversized_size - 1,
+            )
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[0].sent)
+        self.assertEqual(results[0].index, 0)
+        self.assertTrue(results[1].sent)
+        self.assertEqual(results[1].index, 1)
+        # Only the second row triggered a request.
+        client._connection.api_request.assert_called_once()
+        sent_rows = client._connection.api_request.call_args.kwargs["data"]["rows"]
+        self.assertEqual([entry["json"] for entry in sent_rows], [rows[1]])
+
+    def test_insert_rows_json_iterator_is_lazy_and_does_not_read_ahead(self):
+        from google.cloud.bigquery import AutoRowIDs
+
+        rows = [{"col": str(i)} for i in range(6)]
+        rows_iter, pulled = self._tracking_iterator(rows)
+        client = self._make_insert_rows_json_iterator_client({}, {}, {})
+
+        gen = client.insert_rows_json_iterator(
+            "proj.dset.tbl",
+            rows_iter,
+            row_ids=AutoRowIDs.DISABLED,
+            max_rows_per_batch=2,
+        )
+
+        # Constructing the iterator pulls no rows and makes no requests.
+        self.assertEqual(pulled, [])
+        client._connection.api_request.assert_not_called()
+
+        # One result requires the rows of that batch plus at most the single
+        # boundary row that marks the start of the next batch -- never the
+        # whole remaining input.
+        first = next(gen)
+        self.assertEqual(pulled, rows[:3])
+        self.assertEqual(first.index, 0)
+        self.assertEqual(first.row_count, 2)
+        self.assertEqual(client._connection.api_request.call_count, 1)
+
+        second = next(gen)
+        self.assertEqual(pulled, rows[:5])
+        self.assertEqual(second.index, 2)
+        self.assertEqual(second.row_count, 2)
+
+        gen.close()
+
+        # After the caller stops, no further rows are read and no new
+        # requests are created, even though a batch remains.
+        self.assertEqual(pulled, rows[:5])
+        self.assertEqual(client._connection.api_request.call_count, 2)
+
+    def test_insert_rows_json_iterator_retries_reuse_insert_ids(self):
+        from google.api_core import exceptions as api_exceptions
+        from google.api_core import retry as api_retry
+
+        rows = [{"col": "1"}, {"col": "2"}, {"col": "3"}]
+        client = self._make_insert_rows_json_iterator_client(
+            api_exceptions.ServiceUnavailable("transient"), {}
+        )
+
+        retry = api_retry.Retry(
+            predicate=lambda exc: True, initial=0, multiplier=1, deadline=10
+        )
+        with mock.patch("uuid.uuid4", side_effect=map(str, itertools.count())):
+            results = list(
+                client.insert_rows_json_iterator(
+                    "proj.dset.tbl", iter(rows), retry=retry
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].errors, [])
+        # The failed attempt was retried, and both requests carried the very
+        # same payload, including the originally generated insert IDs.
+        self.assertEqual(client._connection.api_request.call_count, 2)
+        first_data = client._connection.api_request.call_args_list[0].kwargs["data"]
+        second_data = client._connection.api_request.call_args_list[1].kwargs["data"]
+        self.assertEqual(first_data, second_data)
+        self.assertEqual(
+            [entry["insertId"] for entry in first_data["rows"]],
+            ["0", "1", "2"],
+        )
+
+    def test_insert_rows_json_iterator_invalid_batch_limits(self):
+        client = self._make_insert_rows_json_iterator_client({})
+
+        for bad_max_rows in (0, -1, 1.5):
+            with self.assertRaises(ValueError):
+                client.insert_rows_json_iterator(
+                    "proj.dset.tbl",
+                    iter([{"col": "1"}]),
+                    max_rows_per_batch=bad_max_rows,
+                )
+
+        for bad_max_bytes in (0, -1, 10.0):
+            with self.assertRaises(ValueError):
+                client.insert_rows_json_iterator(
+                    "proj.dset.tbl",
+                    iter([{"col": "1"}]),
+                    max_bytes_per_batch=bad_max_bytes,
+                )
+
+        client._connection.api_request.assert_not_called()
+
+    def test_insert_rows_json_iterator_non_iterable_rows(self):
+        client = self._make_insert_rows_json_iterator_client({})
+
+        with self.assertRaises(TypeError):
+            client.insert_rows_json_iterator("proj.dset.tbl", object())
+
+    def test_insert_rows_json_iterator_none_row_ids_warns_and_generates_uuids(
+        self,
+    ):
+        rows = [{"col": "1"}, {"col": "2"}]
+        client = self._make_insert_rows_json_iterator_client({})
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with mock.patch("uuid.uuid4", side_effect=map(str, range(len(rows)))):
+                results = list(
+                    client.insert_rows_json_iterator(
+                        "proj.dset.tbl", iter(rows), row_ids=None
+                    )
+                )
+
+        self.assertEqual(len(results), 1)
+        deprecations = [
+            warning
+            for warning in caught
+            if issubclass(warning.category, DeprecationWarning)
+            and "row_ids" in str(warning.message)
+        ]
+        self.assertTrue(deprecations)
+        sent_ids = [
+            entry["insertId"]
+            for entry in client._connection.api_request.call_args.kwargs["data"]["rows"]
+        ]
+        self.assertEqual(sent_ids, ["0", "1"])
+
     def test_list_partitions(self):
         from google.cloud.bigquery.table import Table
 

@@ -20,6 +20,7 @@ from __future__ import division
 
 from collections import abc as collections_abc
 import copy
+import dataclasses
 import datetime
 import functools
 import gzip
@@ -36,6 +37,7 @@ from typing import (
     Dict,
     IO,
     Iterable,
+    Iterator,
     Mapping,
     List,
     Optional,
@@ -143,6 +145,21 @@ if typing.TYPE_CHECKING:  # pragma: NO COVER
 _DEFAULT_CHUNKSIZE = 100 * 1024 * 1024  # 100 MB
 _MAX_MULTIPART_SIZE = 5 * 1024 * 1024
 _DEFAULT_NUM_RETRIES = 6
+
+# An insertAll request is rejected if the JSON payload exceeds 10 MB (and a
+# vastly oversized payload is rejected earlier with HTTP 413). There is also a
+# per-request cap of 10,000 rows.
+# https://cloud.google.com/bigquery/quotas#streaming_inserts
+_INSERTALL_MAX_REQUEST_BYTES = 10 * 1024 * 1024
+_INSERTALL_DEFAULT_MAX_ROWS_PER_BATCH = 1000
+# google.cloud._http.JSONConnection serializes request bodies with
+# ``json.dumps(data)``, whose default separators put a two-byte ", " between
+# array elements. The byte budget for an insertAll batch is therefore the
+# empty-envelope size plus the serialized row entries plus this separator
+# between each pair of entries.
+_INSERTALL_ROW_SEPARATOR_BYTES = len(b", ")
+# An oversized row is reported with this client-side error reason.
+_INSERTALL_ROW_TOO_LARGE_REASON = "rowTooLarge"
 _BASE_UPLOAD_TEMPLATE = "{host}/upload/bigquery/v2/projects/{project}/jobs?uploadType="
 _MULTIPART_URL_TEMPLATE = _BASE_UPLOAD_TEMPLATE + "multipart"
 _RESUMABLE_URL_TEMPLATE = _BASE_UPLOAD_TEMPLATE + "resumable"
@@ -186,6 +203,48 @@ class Project(object):
     def from_api_repr(cls, resource):
         """Factory: construct an instance from a resource dict."""
         return cls(resource["id"], resource["numericId"], resource["friendlyName"])
+
+
+@dataclasses.dataclass(frozen=True)
+class InsertRowsBatchResult:
+    """Result of a single batch processed by an insertAll streaming insert.
+
+    Instances are yielded one at a time by
+    :meth:`Client.insert_rows_json_iterator`, one per ``insertAll`` request
+    that is sent, plus one per input row that is too large to ever be sent
+    (see :attr:`sent`).
+
+    .. versionadded:: 3.41.0
+
+    Attributes:
+        index: Zero-based index, in the input row iterator, of the first row
+            that belongs to this batch.
+        row_count: Number of input rows pulled into this batch. For an
+            oversized-row report (``sent=False``) this is always ``1``.
+        errors: One mapping per row with insert errors, in the same shape as
+            the errors returned by
+            :meth:`~google.cloud.bigquery.client.Client.insert_rows_json`:
+            the ``"index"`` key holds the row's **global** index in the input
+            iterator (not its index within the batch), and the ``"errors"``
+            key holds a list of mappings describing the problems with the
+            row. An empty sequence means the batch was inserted without
+            errors.
+        request_bytes: Size, in UTF-8 bytes, of the complete ``insertAll``
+            request JSON for this batch, including request envelope and all
+            row data. For an oversized row this is the size the request
+            would have had if the row were sent.
+        sent: ``True`` if an ``insertAll`` RPC was actually made for this
+            batch. ``False`` if the batch consists of a single row which,
+            together with the request overhead, already exceeds the byte
+            budget; in that case the row is reported in :attr:`errors` and
+            no request is made.
+    """
+
+    index: int
+    row_count: int
+    errors: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    request_bytes: int = 0
+    sent: bool = True
 
 
 class Client(ClientWithProject):
@@ -4028,6 +4087,325 @@ class Client(ClientWithProject):
 
         return errors
 
+    def insert_rows_json_iterator(
+        self,
+        table: Union[Table, TableReference, TableListItem, str],
+        json_rows: Iterable[Mapping[str, Any]],
+        row_ids: Union[
+            Iterable[Optional[str]], AutoRowIDs, None
+        ] = AutoRowIDs.GENERATE_UUID,
+        skip_invalid_rows: Optional[bool] = None,
+        ignore_unknown_values: Optional[bool] = None,
+        template_suffix: Optional[str] = None,
+        retry: retries.Retry = DEFAULT_RETRY,
+        timeout: TimeoutType = DEFAULT_TIMEOUT,
+        *,
+        max_rows_per_batch: int = _INSERTALL_DEFAULT_MAX_ROWS_PER_BATCH,
+        max_bytes_per_batch: int = _INSERTALL_MAX_REQUEST_BYTES,
+    ) -> Iterator[InsertRowsBatchResult]:
+        """Lazily stream rows into a table via the streaming API.
+
+        See
+        https://cloud.google.com/bigquery/docs/reference/rest/v2/tabledata/insertAll
+
+        Unlike :meth:`insert_rows_json`, this method does not buffer the whole
+        input in memory. It returns an iterator that pulls JSON rows from
+        ``json_rows`` one at a time, groups them into ``insertAll`` batches no
+        bigger than ``max_rows_per_batch`` rows **and** no bigger than
+        ``max_bytes_per_batch`` UTF-8 bytes of complete request JSON, and
+        yields one :class:`InsertRowsBatchResult` per batch as soon as that
+        request has completed.
+
+        Batching and consumption are lazy: rows are only read from
+        ``json_rows`` when the caller asks for the next batch result, so the
+        whole input is never buffered (at most one row beyond the completed
+        batch is held in memory while a batch is sent), and once the caller
+        stops iterating over the results no further rows are read and no
+        further requests are made.
+
+        Each row's ``insertId`` is assigned exactly once, when the row is read.
+        The batch payload (including its ``insertId`` values) is built once and
+        reused by the transport, so network retries always resend the same
+        IDs. Row errors returned by the service use the row's **global** index
+        in ``json_rows``, not its index within the batch.
+
+        If a single row, together with the fixed request overhead, already
+        exceeds ``max_bytes_per_batch``, that row is reported in a batch
+        result with :attr:`InsertRowsBatchResult.sent` set to ``False`` and no
+        ``insertAll`` request is made for it; the following rows are still
+        processed normally.
+
+        .. versionadded:: 3.41.0
+
+        Args:
+            table (Union[ \
+                google.cloud.bigquery.table.Table \
+                google.cloud.bigquery.table.TableReference, \
+                google.cloud.bigquery.table.TableListItem, \
+                str \
+            ]):
+                The destination table for the row data, or a reference to it.
+            json_rows (Iterable[Mapping[str, Any]]):
+                Iterable of row data to be inserted. It is consumed lazily as
+                batch results are requested. Keys must match the table schema
+                fields and values must be JSON-compatible representations.
+            row_ids (Union[Iterable[str], AutoRowIDs, None]):
+                Unique IDs, one per row being inserted. An ID can also be
+                ``None``, indicating that an explicit insert ID should **not**
+                be used for that row. If the argument is omitted altogether,
+                unique IDs are created automatically. IDs are pulled lazily,
+                one per consumed row, and never regenerated for a retry.
+            skip_invalid_rows (Optional[bool]):
+                Insert all valid rows of a request, even if invalid rows exist.
+                The default value is ``False``, which causes the entire request
+                to fail if any invalid rows exist.
+            ignore_unknown_values (Optional[bool]):
+                Accept rows that contain values that do not match the schema.
+                The unknown values are ignored. Default is ``False``, which
+                treats unknown values as errors.
+            template_suffix (Optional[str]):
+                Treat ``name`` as a template table and provide a suffix.
+                BigQuery will create the table ``<name> + <template_suffix>``
+                based on the schema of the template table. See
+                https://cloud.google.com/bigquery/streaming-data-into-bigquery#template-tables
+            retry (Optional[google.api_core.retry.Retry]):
+                How to retry the RPC. Retries reuse the original request
+                payload, including the original per-row ``insertId`` values.
+            timeout (Optional[float]):
+                The number of seconds to wait for the underlying HTTP transport
+                before using ``retry``.
+            max_rows_per_batch (int):
+                Maximum number of rows to include in a single ``insertAll``
+                request. Must be a positive integer.
+            max_bytes_per_batch (int):
+                Maximum size, in UTF-8 bytes, of the complete serialized
+                ``insertAll`` request JSON for a single batch, including the
+                request envelope (``skipInvalidRows``, ``templateSuffix`` and
+                friends) and every row entry. Must be a positive integer.
+
+        Yields:
+            InsertRowsBatchResult:
+                One result per sent batch, plus one per row that is too large
+                to fit in any request. The "index" values in
+                ``result.errors`` are global input indices.
+
+        Raises:
+            TypeError: if ``json_rows`` is not iterable, or if ``row_ids`` is
+                neither an iterable nor an :class:`AutoRowIDs` enum member.
+            ValueError: if ``max_rows_per_batch`` or ``max_bytes_per_batch`` is
+                not a positive integer, or if a custom ``row_ids`` iterable is
+                exhausted before ``json_rows``.
+        """
+        if not isinstance(max_rows_per_batch, int) or max_rows_per_batch <= 0:
+            raise ValueError("max_rows_per_batch must be a positive integer")
+        if not isinstance(max_bytes_per_batch, int) or max_bytes_per_batch <= 0:
+            raise ValueError("max_bytes_per_batch must be a positive integer")
+
+        if row_ids is None:
+            warnings.warn(
+                "Passing None for row_ids is deprecated. To explicitly request "
+                "autogenerated insert IDs, use AutoRowIDs.GENERATE_UUID instead",
+                category=DeprecationWarning,
+            )
+            row_ids = AutoRowIDs.GENERATE_UUID
+
+        if isinstance(row_ids, AutoRowIDs):
+            row_ids_iter: Optional[Iterator[Optional[str]]] = None
+        else:
+            try:
+                row_ids_iter = iter(row_ids)
+            except TypeError:
+                msg = "row_ids is neither an iterable nor an AutoRowIDs enum member"
+                raise TypeError(msg)
+
+        try:
+            json_rows_iter: Iterator[Mapping[str, Any]] = iter(json_rows)
+        except TypeError:
+            raise TypeError("json_rows argument should be an iterable of dicts")
+
+        # Convert table to just a reference because, like insert_rows_json,
+        # no local type conversions are applied.
+        table_ref = _table_arg_to_table_ref(table, default_project=self.project)
+
+        return self._insert_rows_json_iterator(
+            table=table_ref,
+            json_rows_iter=json_rows_iter,
+            row_ids=row_ids,
+            row_ids_iter=row_ids_iter,
+            skip_invalid_rows=skip_invalid_rows,
+            ignore_unknown_values=ignore_unknown_values,
+            template_suffix=template_suffix,
+            retry=retry,
+            timeout=timeout,
+            max_rows_per_batch=max_rows_per_batch,
+            max_bytes_per_batch=max_bytes_per_batch,
+        )
+
+    def _insert_rows_json_iterator(
+        self,
+        *,
+        table: TableReference,
+        json_rows_iter: Iterator[Mapping[str, Any]],
+        row_ids: Union[Iterable[Optional[str]], AutoRowIDs],
+        row_ids_iter: Optional[Iterator[Optional[str]]],
+        skip_invalid_rows: Optional[bool],
+        ignore_unknown_values: Optional[bool],
+        template_suffix: Optional[str],
+        retry: retries.Retry,
+        timeout: TimeoutType,
+        max_rows_per_batch: int,
+        max_bytes_per_batch: int,
+    ) -> Iterator[InsertRowsBatchResult]:
+        options: Dict[str, Any] = {}
+        if skip_invalid_rows is not None:
+            options["skipInvalidRows"] = skip_invalid_rows
+        if ignore_unknown_values is not None:
+            options["ignoreUnknownValues"] = ignore_unknown_values
+        if template_suffix is not None:
+            options["templateSuffix"] = template_suffix
+
+        # Size of the request JSON with an empty "rows" array. The connection
+        # serializes dict bodies with json.dumps(), so measure the payload the
+        # same way to make the byte budget match the on-the-wire request size.
+        envelope: Dict[str, Any] = {"rows": []}
+        envelope.update(options)
+        overhead_bytes = _insertall_json_size(envelope)
+
+        path = "%s/insertAll" % table.path
+        entries: List[Dict[str, Any]] = []
+        batch_bytes = overhead_bytes
+        global_index = 0
+
+        for row in json_rows_iter:
+            # Assign the insert ID exactly once per row pulled from the input.
+            if row_ids is AutoRowIDs.GENERATE_UUID:
+                insert_id: Optional[str] = str(uuid.uuid4())
+            elif row_ids is AutoRowIDs.DISABLED:
+                insert_id = None
+            else:
+                assert row_ids_iter is not None  # guaranteed by the caller
+                try:
+                    insert_id = next(row_ids_iter)
+                except StopIteration:
+                    msg = (
+                        "row_ids did not generate enough IDs, error at index "
+                        f"{global_index}"
+                    )
+                    raise ValueError(msg)
+
+            entry = {"json": row, "insertId": insert_id}
+            entry_bytes = _insertall_json_size(entry)
+            candidate_bytes = batch_bytes + entry_bytes
+            if entries:
+                candidate_bytes += _INSERTALL_ROW_SEPARATOR_BYTES
+
+            # The current row no longer fits: send the rows gathered so far as
+            # a batch before deciding what to do with the current row. The
+            # current row is the only row read ahead beyond the batch sent.
+            if entries and (
+                len(entries) >= max_rows_per_batch
+                or candidate_bytes > max_bytes_per_batch
+            ):
+                batch_start = global_index - len(entries)
+                data: Dict[str, Any] = {"rows": entries}
+                data.update(options)
+                entries = []
+                yield self._send_insertall_batch(
+                    path=path,
+                    data=data,
+                    batch_start=batch_start,
+                    request_bytes=batch_bytes,
+                    retry=retry,
+                    timeout=timeout,
+                )
+                batch_bytes = overhead_bytes
+                candidate_bytes = overhead_bytes + entry_bytes
+
+            if candidate_bytes > max_bytes_per_batch:
+                # A single row plus the fixed request overhead already exceeds
+                # the budget: report it explicitly without sending anything.
+                message = (
+                    "Row at global index {index} cannot be sent in an insertAll "
+                    "request: its JSON data plus the request envelope would be "
+                    "{actual} UTF-8 bytes, exceeding max_bytes_per_batch "
+                    "({maximum} UTF-8 bytes). The row was not sent."
+                ).format(
+                    index=global_index,
+                    actual=candidate_bytes,
+                    maximum=max_bytes_per_batch,
+                )
+                yield InsertRowsBatchResult(
+                    index=global_index,
+                    row_count=1,
+                    errors=[
+                        {
+                            "index": global_index,
+                            "errors": [
+                                {
+                                    "reason": _INSERTALL_ROW_TOO_LARGE_REASON,
+                                    "message": message,
+                                    "actualBytes": candidate_bytes,
+                                    "maximumBytes": max_bytes_per_batch,
+                                }
+                            ],
+                        }
+                    ],
+                    request_bytes=candidate_bytes,
+                    sent=False,
+                )
+            else:
+                entries.append(entry)
+                batch_bytes = candidate_bytes
+
+            global_index += 1
+
+        if entries:
+            batch_start = global_index - len(entries)
+            data = {"rows": entries}
+            data.update(options)
+            yield self._send_insertall_batch(
+                path=path,
+                data=data,
+                batch_start=batch_start,
+                request_bytes=batch_bytes,
+                retry=retry,
+                timeout=timeout,
+            )
+
+    def _send_insertall_batch(
+        self,
+        path: str,
+        data: Dict[str, Any],
+        batch_start: int,
+        request_bytes: int,
+        retry: retries.Retry,
+        timeout: TimeoutType,
+    ) -> InsertRowsBatchResult:
+        # The data dict (with all insertId values) is built once and reused
+        # for every transport-level retry, so retries resend the original IDs.
+        response = self._call_api(
+            retry,
+            span_name="BigQuery.insertRowsJsonIterator",
+            span_attributes={"path": path},
+            method="POST",
+            path=path,
+            data=data,
+            timeout=timeout,
+        )
+        errors = [
+            # Translate the row's index within this batch to its global index
+            # in the caller's input iterator.
+            {"index": int(error["index"]) + batch_start, "errors": error["errors"]}
+            for error in response.get("insertErrors", ())
+        ]
+        return InsertRowsBatchResult(
+            index=batch_start,
+            row_count=len(data["rows"]),
+            errors=errors,
+            request_bytes=request_bytes,
+            sent=True,
+        )
+
     def list_partitions(
         self,
         table: Union[Table, TableReference, TableListItem, str],
@@ -4552,3 +4930,13 @@ def _add_server_timeout_header(headers: Optional[Dict[str, str]], kwargs):
         kwargs["headers"] = headers
 
     return kwargs
+
+
+def _insertall_json_size(value: Any) -> int:
+    """Return the UTF-8 byte size of an insertAll request payload fragment.
+
+    The JSON connection serializes dict request bodies with ``json.dumps()``
+    (default separators, ``ensure_ascii=True``), so this matches the exact
+    number of UTF-8 bytes written to the wire, byte for byte.
+    """
+    return len(json.dumps(value).encode("utf-8"))
